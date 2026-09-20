@@ -11,16 +11,19 @@ GO
 BEGIN TRY
     BEGIN TRANSACTION;
 
+    DECLARE @PersistTestData BIT = COALESCE(TRY_CONVERT(BIT, SESSION_CONTEXT(N'PersistAutomationTestData')), 0);
+    DECLARE @TestRunId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @TestRunToken VARCHAR(8) = LEFT(REPLACE(CONVERT(VARCHAR(36), @TestRunId), '-', ''), 8);
     DECLARE @Now DATETIMEOFFSET = SYSUTCDATETIME() AT TIME ZONE 'UTC';
     DECLARE @ActorId UNIQUEIDENTIFIER = NEWID();
-    DECLARE @ContactId UNIQUEIDENTIFIER = NEWID();
-    DECLARE @CompanyId UNIQUEIDENTIFIER = NEWID();
-    DECLARE @GroupDefault UNIQUEIDENTIFIER = NEWID();
-    DECLARE @GroupEscalation UNIQUEIDENTIFIER = NEWID();
-    DECLARE @GroupVip UNIQUEIDENTIFIER = NEWID();
-    DECLARE @AgentAvailable UNIQUEIDENTIFIER = NEWID();
-    DECLARE @AgentUnavailable UNIQUEIDENTIFIER = NEWID();
-    DECLARE @CustomDepartment UNIQUEIDENTIFIER = NEWID();
+    DECLARE @ContactId UNIQUEIDENTIFIER;
+    DECLARE @CompanyId UNIQUEIDENTIFIER;
+    DECLARE @GroupDefault UNIQUEIDENTIFIER;
+    DECLARE @GroupEscalation UNIQUEIDENTIFIER;
+    DECLARE @GroupVip UNIQUEIDENTIFIER;
+    DECLARE @AgentAvailable UNIQUEIDENTIFIER;
+    DECLARE @AgentUnavailable UNIQUEIDENTIFIER;
+    DECLARE @CustomDepartment UNIQUEIDENTIFIER;
 
     DECLARE @CreateTicket UNIQUEIDENTIFIER = NEWID();
     DECLARE @StatusTicket UNIQUEIDENTIFIER = NEWID();
@@ -40,6 +43,14 @@ BEGIN TRY
         Result VARCHAR(10) NOT NULL,
         Evidence NVARCHAR(1000) NOT NULL
     );
+
+    CREATE TABLE #OriginalTriggerState
+    (
+        TriggerId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+        IsActive BIT NOT NULL
+    );
+    INSERT #OriginalTriggerState (TriggerId, IsActive)
+    SELECT Id, IsActive FROM dbo.AutomationTriggers;
 
     -- Isolate this suite from sample/business triggers while preserving all changes via rollback.
     UPDATE dbo.AutomationTriggers SET IsActive = 0;
@@ -62,39 +73,85 @@ BEGIN TRY
     WHEN NOT MATCHED THEN INSERT (EventType, ExecutionMode, IsActive)
         VALUES (source.EventType, source.ExecutionMode, 1);
 
-    -- Deterministic entity fixtures from the common rule test configuration.
-    INSERT dbo.Companies (Id, Name, CreatedBy, UpdatedBy)
-    VALUES (@CompanyId, N'[TEST] VIP Company', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
-    INSERT dbo.CompanyDomains (CompanyId, Domain, CreatedBy)
-    VALUES (@CompanyId, 'vip.automation.test', N'AUTOMATION_TEST');
-    INSERT dbo.Contacts
-        (Id, Name, PrimaryEmail, PrimaryCompanyId, Status, CreatedBy, UpdatedBy)
-    VALUES
-        (@ContactId, N'[TEST] Active Requester', N'automation-test@example.test', @CompanyId, 1,
-         N'AUTOMATION_TEST', N'AUTOMATION_TEST');
-    INSERT dbo.Groups (Id, Name, CreatedBy, UpdatedBy)
-    VALUES
-        (@GroupDefault, N'[TEST] Default', N'AUTOMATION_TEST', N'AUTOMATION_TEST'),
-        (@GroupEscalation, N'[TEST] Escalation', N'AUTOMATION_TEST', N'AUTOMATION_TEST'),
-        (@GroupVip, N'[TEST] VIP', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
-    INSERT dbo.Agents
-        (Id, FullName, Email, Status, TicketAvailability, CreatedBy)
-    VALUES
-        (@AgentAvailable, N'[TEST] Available', N'available-' + CONVERT(NVARCHAR(36), NEWID()) + N'@example.test', 1, 1, N'AUTOMATION_TEST'),
-        (@AgentUnavailable, N'[TEST] Unavailable', N'unavailable-' + CONVERT(NVARCHAR(36), NEWID()) + N'@example.test', 1, 0, N'AUTOMATION_TEST');
-    INSERT dbo.GroupAgents (AgentId, GroupId, CreatedBy)
-    VALUES (@AgentAvailable, @GroupVip, N'AUTOMATION_TEST');
+    -- Deterministic entity fixtures from the common rule test configuration. Reuse the persistent
+    -- common-rule seed when present so this transactional suite remains safe to run before or after it.
+    SELECT @CompanyId = Id FROM dbo.Companies WHERE Name = N'[TEST] VIP Company';
+    IF @CompanyId IS NULL
+    BEGIN
+        SET @CompanyId = NEWID();
+        INSERT dbo.Companies (Id, Name, CreatedBy, UpdatedBy)
+        VALUES (@CompanyId, N'[TEST] VIP Company', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
+    END;
+    IF NOT EXISTS (SELECT 1 FROM dbo.CompanyDomains WHERE CompanyId = @CompanyId AND Domain = 'vip.automation.test')
+        INSERT dbo.CompanyDomains (CompanyId, Domain, CreatedBy)
+        VALUES (@CompanyId, 'vip.automation.test', N'AUTOMATION_TEST');
 
-    INSERT dbo.TicketFields
-    (
-        Id, FieldCode, FieldLabelForCustomer, FieldLabelForAgent, FieldType, FieldCategory,
-        CreatedBy, UpdatedBy
-    )
-    VALUES
-    (
-        @CustomDepartment, 'CUSTOM_DEPARTMENT', N'Department', N'Department',
-        'SINGLE_LINE_TEXT', 'CUSTOM', N'AUTOMATION_TEST', N'AUTOMATION_TEST'
-    );
+    SELECT @ContactId = Id FROM dbo.Contacts WHERE PrimaryEmail = N'active-requester@automation.test';
+    IF @ContactId IS NULL
+    BEGIN
+        SET @ContactId = NEWID();
+        INSERT dbo.Contacts
+            (Id, Name, PrimaryEmail, PrimaryCompanyId, Status, CreatedBy, UpdatedBy)
+        VALUES
+            (@ContactId, N'[TEST] Active Requester', N'active-requester@automation.test', @CompanyId, 1,
+             N'AUTOMATION_TEST', N'AUTOMATION_TEST');
+    END;
+
+    SELECT @GroupDefault = Id FROM dbo.Groups WHERE Name = N'[TEST] Default';
+    IF @GroupDefault IS NULL
+    BEGIN
+        SET @GroupDefault = NEWID();
+        INSERT dbo.Groups (Id, Name, CreatedBy, UpdatedBy)
+        VALUES (@GroupDefault, N'[TEST] Default', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
+    END;
+    SELECT @GroupEscalation = Id FROM dbo.Groups WHERE Name = N'[TEST] Escalation';
+    IF @GroupEscalation IS NULL
+    BEGIN
+        SET @GroupEscalation = NEWID();
+        INSERT dbo.Groups (Id, Name, CreatedBy, UpdatedBy)
+        VALUES (@GroupEscalation, N'[TEST] Escalation', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
+    END;
+    SELECT @GroupVip = Id FROM dbo.Groups WHERE Name = N'[TEST] VIP';
+    IF @GroupVip IS NULL
+    BEGIN
+        SET @GroupVip = NEWID();
+        INSERT dbo.Groups (Id, Name, CreatedBy, UpdatedBy)
+        VALUES (@GroupVip, N'[TEST] VIP', N'AUTOMATION_TEST', N'AUTOMATION_TEST');
+    END;
+
+    SELECT @AgentAvailable = Id FROM dbo.Agents WHERE Email = N'available-agent@automation.test';
+    IF @AgentAvailable IS NULL
+    BEGIN
+        SET @AgentAvailable = NEWID();
+        INSERT dbo.Agents (Id, FullName, Email, Status, TicketAvailability, CreatedBy)
+        VALUES (@AgentAvailable, N'[TEST] Available Agent', N'available-agent@automation.test', 1, 1, N'AUTOMATION_TEST');
+    END;
+    SELECT @AgentUnavailable = Id FROM dbo.Agents WHERE Email = N'unavailable-agent@automation.test';
+    IF @AgentUnavailable IS NULL
+    BEGIN
+        SET @AgentUnavailable = NEWID();
+        INSERT dbo.Agents (Id, FullName, Email, Status, TicketAvailability, CreatedBy)
+        VALUES (@AgentUnavailable, N'[TEST] Unavailable Agent', N'unavailable-agent@automation.test', 1, 0, N'AUTOMATION_TEST');
+    END;
+    IF NOT EXISTS (SELECT 1 FROM dbo.GroupAgents WHERE AgentId = @AgentAvailable AND GroupId = @GroupVip)
+        INSERT dbo.GroupAgents (AgentId, GroupId, CreatedBy)
+        VALUES (@AgentAvailable, @GroupVip, N'AUTOMATION_TEST');
+
+    SELECT @CustomDepartment = Id FROM dbo.TicketFields WHERE FieldCode = 'CUSTOM_DEPARTMENT';
+    IF @CustomDepartment IS NULL
+    BEGIN
+        SET @CustomDepartment = NEWID();
+        INSERT dbo.TicketFields
+        (
+            Id, FieldCode, FieldLabelForCustomer, FieldLabelForAgent, FieldType, FieldCategory,
+            CreatedBy, UpdatedBy
+        )
+        VALUES
+        (
+            @CustomDepartment, 'CUSTOM_DEPARTMENT', N'Department', N'Department',
+            'SINGLE_LINE_TEXT', 'CUSTOM', N'AUTOMATION_TEST', N'AUTOMATION_TEST'
+        );
+    END;
 
     INSERT dbo.Tickets
     (
@@ -103,29 +160,29 @@ BEGIN TRY
         CreatedBy, CreatedAt, UpdatedBy, UpdatedAt, IsDeleted
     )
     VALUES
-        (@CreateTicket, '#TESTCRT001', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Creation routing', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'URGENT', @Now,
+        (@CreateTicket, '#AT' + @TestRunToken + 'C', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Creation routing', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'URGENT', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@StatusTicket, '#TESTSTS001', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Status event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'HIGH', @Now,
+        (@StatusTicket, '#AT' + @TestRunToken + 'S', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Status event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'HIGH', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@PriorityTicket, '#TESTPRI001', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Priority event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'HIGH', @Now,
+        (@PriorityTicket, '#AT' + @TestRunToken + 'P', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Priority event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'HIGH', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@GroupTicket, '#TESTGRP001', @ContactId, @CompanyId, @GroupDefault, @AgentUnavailable,
-         N'Group event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'LOW', @Now,
+        (@GroupTicket, '#AT' + @TestRunToken + 'G', @ContactId, @CompanyId, @GroupDefault, @AgentUnavailable,
+         N'[' + @TestRunToken + N'] Group event', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'LOW', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@AssigneeTicket, '#TESTAGN001', @ContactId, @CompanyId, @GroupDefault, @AgentUnavailable,
-         N'Assignee event', N'test', N'test', 'PORTAL_AGENT', 'PENDING', 'LOW', @Now,
+        (@AssigneeTicket, '#AT' + @TestRunToken + 'A', @ContactId, @CompanyId, @GroupDefault, @AgentUnavailable,
+         N'[' + @TestRunToken + N'] Assignee event', N'test', N'test', 'PORTAL_AGENT', 'PENDING', 'LOW', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@RequesterTicket, '#TESTRPL001', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Requester reply', N'test', N'test', 'PORTAL_AGENT', 'PENDING', 'LOW', @Now,
+        (@RequesterTicket, '#AT' + @TestRunToken + 'R', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Requester reply', N'test', N'test', 'PORTAL_AGENT', 'PENDING', 'LOW', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@AgentTicket, '#TESTRPL002', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Agent reply', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'LOW', @Now,
+        (@AgentTicket, '#AT' + @TestRunToken + 'Y', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Agent reply', N'test', N'test', 'PORTAL_AGENT', 'OPEN', 'LOW', @Now,
          N'AUTOMATION_TEST', @Now, N'AUTOMATION_TEST', @Now, 0),
-        (@ScheduleTicket, '#TESTSCH001', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
-         N'Schedule event', N'test', N'test', 'PORTAL_AGENT', 'RESOLVED', 'LOW', DATEADD(HOUR, -49, @Now),
+        (@ScheduleTicket, '#AT' + @TestRunToken + 'T', @ContactId, @CompanyId, @GroupDefault, @AgentAvailable,
+         N'[' + @TestRunToken + N'] Schedule event', N'test', N'test', 'PORTAL_AGENT', 'RESOLVED', 'LOW', DATEADD(HOUR, -49, @Now),
          N'AUTOMATION_TEST', DATEADD(HOUR, -72, @Now), N'AUTOMATION_TEST', DATEADD(HOUR, -49, @Now), 0);
 
     INSERT dbo.TicketFieldValues
@@ -148,17 +205,17 @@ BEGIN TRY
 
     INSERT dbo.AutomationTriggers (Id, Name, EventType, Priority, IsActive)
     VALUES
-        (@CrtVip, N'[TEST] CRT_URGENT_VIP', 'TICKET_CREATED', 9010, 1),
-        (@CrtEsc, N'[TEST] CRT_URGENT_ESCALATION', 'TICKET_CREATED', 9020, 1),
-        (@CrtDefault, N'[TEST] CRT_DEFAULT_ROUTE', 'TICKET_CREATED', 9090, 1),
-        (@StatusResolved, N'[TEST] UPD_STATUS_RESOLVED_HIGH', 'STATUS_CHANGED', 9100, 1),
-        (@PriorityRoute, N'[TEST] UPD_PRIORITY_URGENT_ROUTE', 'PRIORITY_CHANGED', 9110, 1),
-        (@PriorityNotify, N'[TEST] UPD_PRIORITY_URGENT_NOTIFY', 'PRIORITY_CHANGED', 9120, 1),
-        (@GroupAssign, N'[TEST] UPD_GROUP_VIP_ASSIGN', 'GROUP_CHANGED', 9130, 1),
-        (@AssigneeOpen, N'[TEST] UPD_ASSIGNEE_AVAILABLE_OPEN', 'ASSIGNEE_CHANGED', 9140, 1),
-        (@RequesterOpen, N'[TEST] UPD_REQUESTER_REPLY_REOPEN', 'REQUESTER_REPLIED', 9150, 1),
-        (@AgentWait, N'[TEST] UPD_AGENT_REPLY_WAIT', 'AGENT_REPLIED', 9160, 1),
-        (@ScheduleClose, N'[TEST] SCH_RESOLVED_CLOSE_48H', 'SCHEDULE_DUE', 9210, 1);
+        (@CrtVip, N'[RUN ' + @TestRunToken + N'] CRT_URGENT_VIP', 'TICKET_CREATED', 9010, 1),
+        (@CrtEsc, N'[RUN ' + @TestRunToken + N'] CRT_URGENT_ESCALATION', 'TICKET_CREATED', 9020, 1),
+        (@CrtDefault, N'[RUN ' + @TestRunToken + N'] CRT_DEFAULT_ROUTE', 'TICKET_CREATED', 9090, 1),
+        (@StatusResolved, N'[RUN ' + @TestRunToken + N'] UPD_STATUS_RESOLVED_HIGH', 'STATUS_CHANGED', 9100, 1),
+        (@PriorityRoute, N'[RUN ' + @TestRunToken + N'] UPD_PRIORITY_URGENT_ROUTE', 'PRIORITY_CHANGED', 9110, 1),
+        (@PriorityNotify, N'[RUN ' + @TestRunToken + N'] UPD_PRIORITY_URGENT_NOTIFY', 'PRIORITY_CHANGED', 9120, 1),
+        (@GroupAssign, N'[RUN ' + @TestRunToken + N'] UPD_GROUP_VIP_ASSIGN', 'GROUP_CHANGED', 9130, 1),
+        (@AssigneeOpen, N'[RUN ' + @TestRunToken + N'] UPD_ASSIGNEE_AVAILABLE_OPEN', 'ASSIGNEE_CHANGED', 9140, 1),
+        (@RequesterOpen, N'[RUN ' + @TestRunToken + N'] UPD_REQUESTER_REPLY_REOPEN', 'REQUESTER_REPLIED', 9150, 1),
+        (@AgentWait, N'[RUN ' + @TestRunToken + N'] UPD_AGENT_REPLY_WAIT', 'AGENT_REPLIED', 9160, 1),
+        (@ScheduleClose, N'[RUN ' + @TestRunToken + N'] SCH_RESOLVED_CLOSE_48H', 'SCHEDULE_DUE', 9210, 1);
 
     DECLARE @Block UNIQUEIDENTIFIER;
     SET @Block = NEWID(); INSERT dbo.AutomationTriggerBlocks (Id, TriggerId, LogicalOperator) VALUES (@Block, @CrtVip, 'AND');
@@ -419,22 +476,40 @@ BEGIN TRY
         THROW 52130,'BATCH-01 skipped or duplicated an operation.',1;
     INSERT #Results VALUES ('BATCH-01',NULL,@StatusTicket,NULL,'PASS',N'Five operations collected in deterministic 2,2,1 batches');
 
-    -- RET-01: queue cleanup does not remove durable evaluation audit -------------------------------
-    DECLARE @AuditBefore INT=(SELECT COUNT(*) FROM dbo.AutomationEvaluations WHERE QueueSummaryId IN
-        (SELECT QueueSummaryId FROM #Results WHERE QueueSummaryId IS NOT NULL));
-    EXEC dbo.ganymede_automationRetentionCleanupBatch
-        @BatchSize=50000,@QueueRetentionDays=0,@RuleAuditRetentionDays=99999,@AuditRetentionDays=99999;
-    IF @AuditBefore=0 OR (SELECT COUNT(*) FROM dbo.AutomationEvaluations WHERE QueueSummaryId IN
-        (SELECT QueueSummaryId FROM #Results WHERE QueueSummaryId IS NOT NULL))<>@AuditBefore
-        THROW 52131,'RET-01 queue cleanup removed durable evaluation audit.',1;
-    INSERT #Results VALUES ('RET-01',NULL,NULL,NULL,'PASS',N'Bounded queue cleanup retained durable evaluation audit');
+    -- RET-01: queue cleanup does not remove durable evaluation audit. Observable runs keep queue
+    -- rows so their full pipeline can be inspected after commit.
+    IF @PersistTestData = 0
+    BEGIN
+        DECLARE @AuditBefore INT=(SELECT COUNT(*) FROM dbo.AutomationEvaluations WHERE QueueSummaryId IN
+            (SELECT QueueSummaryId FROM #Results WHERE QueueSummaryId IS NOT NULL));
+        EXEC dbo.ganymede_automationRetentionCleanupBatch
+            @BatchSize=50000,@QueueRetentionDays=0,@RuleAuditRetentionDays=99999,@AuditRetentionDays=99999;
+        IF @AuditBefore=0 OR (SELECT COUNT(*) FROM dbo.AutomationEvaluations WHERE QueueSummaryId IN
+            (SELECT QueueSummaryId FROM #Results WHERE QueueSummaryId IS NOT NULL))<>@AuditBefore
+            THROW 52131,'RET-01 queue cleanup removed durable evaluation audit.',1;
+        INSERT #Results VALUES ('RET-01',NULL,NULL,NULL,'PASS',N'Bounded queue cleanup retained durable evaluation audit');
+    END;
 
     SELECT TestCaseId,OperationId,TicketId,QueueSummaryId,Result,Evidence
     FROM #Results ORDER BY TestCaseId;
     SELECT COUNT(*) AS PassedTestCount FROM #Results WHERE Result='PASS';
+    SELECT @TestRunId AS TestRunId, @TestRunToken AS TestRunToken, @PersistTestData AS Persisted;
 
-    ROLLBACK TRANSACTION;
-    PRINT 'PASS: acceptance test transaction rolled back; no [TEST] fixture/configuration data persisted.';
+    IF @PersistTestData = 1
+    BEGIN
+        UPDATE t
+        SET IsActive = original.IsActive
+        FROM dbo.AutomationTriggers t
+        JOIN #OriginalTriggerState original ON original.TriggerId = t.Id;
+
+        COMMIT TRANSACTION;
+        PRINT 'PASS: observable acceptance run committed. Filter Tickets by the returned TestRunToken.';
+    END
+    ELSE
+    BEGIN
+        ROLLBACK TRANSACTION;
+        PRINT 'PASS: acceptance test transaction rolled back; no suite-created fixture/configuration data persisted.';
+    END;
 END TRY
 BEGIN CATCH
     IF XACT_STATE()<>0 ROLLBACK TRANSACTION;
