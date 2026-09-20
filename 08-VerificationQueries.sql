@@ -1,477 +1,391 @@
 -- =================================================================================================
--- OneDesk Automation v1.0 - Phase 6: Automated Verification & Audit Script
+-- OneDesk Automation - non-destructive verification
+-- All smoke-test writes are enclosed in one transaction and always rolled back.
+-- Run after 01, 02, 03, 04, 05, 07, 09, 10, and 11.
 -- =================================================================================================
 USE OneDeskDb;
 GO
-
-SET ANSI_NULLS ON;
-GO
-SET QUOTED_IDENTIFIER ON;
-GO
 SET NOCOUNT ON;
+SET XACT_ABORT ON;
 GO
 
-PRINT '================================================================================';
-PRINT 'STARTING ONEDESK AUTOMATION V1.0 VERIFICATION SUITE';
-PRINT '================================================================================';
+PRINT 'OneDesk Automation verification starting';
 
--- Clean up any leftover test data
-DELETE FROM dbo.AutomationExecutionActions;
-DELETE FROM dbo.AutomationExecutions;
-DELETE FROM dbo.AutomationTriggerQueueRule;
-DELETE FROM dbo.AutomationTriggerQueueDelta;
-DELETE FROM dbo.AutomationTriggerQueueSource;
-DELETE FROM dbo.AutomationTriggerQueueSummary;
-DELETE FROM dbo.TicketActivityLogs;
-DELETE FROM dbo.Tickets;
+IF OBJECT_ID('dbo.AutomationEvaluations', 'U') IS NULL
+    THROW 51000, 'Missing durable evaluation audit table.', 1;
+IF OBJECT_ID('dbo.AutomationEvaluationBlocks', 'U') IS NULL
+    THROW 51001, 'Missing durable block audit table.', 1;
+IF OBJECT_ID('dbo.AutomationEvaluationRules', 'U') IS NULL
+    THROW 51002, 'Missing durable rule audit table.', 1;
+IF OBJECT_ID('dbo.AutomationTriggerQueueTrigger', 'U') IS NULL
+    THROW 51003, 'Missing selected-trigger queue table.', 1;
+IF OBJECT_ID('dbo.AutomationTriggerQueueAction', 'U') IS NULL
+    THROW 51004, 'Missing action queue table.', 1;
+IF OBJECT_ID('dbo.AutomationActionHistories', 'U') IS NULL
+    THROW 51005, 'Missing immutable action history table.', 1;
+IF OBJECT_ID('dbo.ganymede_automationActionProcessBatch', 'P') IS NULL
+    THROW 51006, 'Missing database action processor.', 1;
 
-DECLARE @TestTicketId UNIQUEIDENTIFIER = NEWID();
-DECLARE @TestActorId UNIQUEIDENTIFIER = NEWID();
-DECLARE @TestContactId UNIQUEIDENTIFIER = NEWID();
-DECLARE @TestGroupId UNIQUEIDENTIFIER = NEWID();
-DECLARE @TestAgentId UNIQUEIDENTIFIER = NEWID();
-DECLARE @TicketNo VARCHAR(30) = 'TCK-VERIFY-' + FORMAT(SYSUTCDATETIME(), 'HHmmssfff');
+BEGIN TRY
+    BEGIN TRANSACTION;
 
--- -------------------------------------------------------------------------------------------------
--- TEST 1: Ticket Creation, Activity Log & FIRST_MATCH Evaluation
--- -------------------------------------------------------------------------------------------------
-PRINT '--- [TEST 1] Creating Test Ticket with subject containing URGENT and status OPEN ---';
+    DECLARE @TicketId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @ActorId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @OperationId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @TicketNo VARCHAR(25) = '#V' + RIGHT(REPLACE(CONVERT(VARCHAR(36), NEWID()), '-', ''), 9);
 
-INSERT INTO dbo.Tickets
-(
-    Id,
-    TicketNo,
-    RequesterContactId,
-    GroupId,
-    AssignedAgentId,
-    Subject,
-    Description,
-    PlainDescription,
-    Source,
-    Status,
-    Priority,
-    CreatedBy,
-    CreatedAt,
-    UpdatedBy,
-    UpdatedAt,
-    IsDeleted
-)
-VALUES
-(
-    @TestTicketId,
-    @TicketNo,
-    @TestContactId,
-    @TestGroupId,
-    @TestAgentId,
-    'URGENT: Core Database Latency High',
-    '<p>Core database latency high</p>',
-    'Core database latency high',
-    'PORTAL_AGENT',
-    'OPEN',
-    'MEDIUM',
-    'tester@onedesk.local',
-    (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-    'tester@onedesk.local',
-    (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-    0
-);
+    INSERT dbo.Tickets
+    (
+        Id, TicketNo, RequesterContactId, GroupId, AssignedAgentId,
+        Subject, Description, PlainDescription, Source, Status, Priority,
+        CreatedBy, CreatedAt, UpdatedBy, UpdatedAt, IsDeleted
+    )
+    VALUES
+    (
+        @TicketId, @TicketNo, NEWID(), NEWID(), NEWID(),
+        'URGENT: transactional automation verification', 'verification', 'verification',
+        'PORTAL_AGENT', 'OPEN', 'MEDIUM', 'AUTOMATION_TEST',
+        SYSUTCDATETIME() AT TIME ZONE 'UTC', 'AUTOMATION_TEST',
+        SYSUTCDATETIME() AT TIME ZONE 'UTC', 0
+    );
 
--- Generate Activity Log via integrated SP
-EXEC dbo.ganymede_ticketActivityLogCreateForCreatedTicket
-    @TicketId = @TestTicketId,
-    @ActorId = @TestActorId,
-    @AutomationExecutionId = NULL;
+    EXEC dbo.ganymede_ticketActivityLogCreateForCreatedTicket
+        @TicketId = @TicketId,
+        @ActorId = @ActorId,
+        @AutomationExecutionId = NULL,
+        @OperationId = @OperationId;
 
--- Verify Activity Log created with NULL AutomationExecutionId
-IF EXISTS (
-    SELECT 1 FROM dbo.TicketActivityLogs 
-    WHERE TicketId = @TestTicketId 
-      AND Event = 'TICKET_CREATED' 
-      AND AutomationExecutionId IS NULL
-)
-    PRINT 'PASS: Activity log for TICKET_CREATED created with AutomationExecutionId IS NULL.';
-ELSE
-    PRINT 'FAIL: Activity log for TICKET_CREATED was not created properly.';
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.TicketActivityLogs
+        WHERE TicketId = @TicketId AND Event = 'TICKET_CREATED'
+          AND OperationId = @OperationId AND AutomationExecutionId IS NULL
+    )
+        THROW 51010, 'Create activity did not preserve OperationId.', 1;
 
--- Collect batch
-DECLARE @Collected1 INT = 0;
-EXEC dbo.ganymede_automationTriggerQueueCollectBatch
-    @BatchSize = 10,
-    @CollectedCount = @Collected1 OUTPUT;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.Tickets
+        WHERE Id = @TicketId AND CreateAutomationStatus = 'PENDING'
+    )
+        THROW 51011, 'Ticket creation visibility was not gated.', 1;
 
-PRINT 'Collected items count: ' + CAST(@Collected1 AS VARCHAR(10));
+    DECLARE @Collected INT;
+    EXEC dbo.ganymede_automationTriggerQueueCollectBatch
+        @BatchSize = 2000,
+        @CollectedCount = @Collected OUTPUT;
 
--- Verify Queue Item lineage
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationTriggerQueueSummary 
-    WHERE TicketId = @TestTicketId 
-      AND QueueSourceType = 'ACTIVITY_LOG' 
-      AND ExecutionDepth = 0 
-      AND RootExecutionId IS NULL
-)
-    PRINT 'PASS: Queue summary item created with ExecutionDepth = 0 and RootExecutionId IS NULL.';
-ELSE
-    PRINT 'FAIL: Queue summary item missing or invalid lineage.';
+    DECLARE @QueueSummaryId BIGINT =
+    (
+        SELECT Id FROM dbo.AutomationTriggerQueueSummary
+        WHERE TicketId = @TicketId AND OperationId = @OperationId
+    );
 
--- Evaluate batch
-DECLARE @Evaluated1 INT = 0;
-DECLARE @ExecutionsCreated1 INT = 0;
-EXEC dbo.ganymede_automationEvaluateBatch
-    @BatchSize = 10,
-    @EvaluatedCount = @Evaluated1 OUTPUT,
-    @ExecutionsCreatedCount = @ExecutionsCreated1 OUTPUT;
+    IF @QueueSummaryId IS NULL
+        THROW 51012, 'Collector did not create an operation summary.', 1;
 
-PRINT 'Evaluated items: ' + CAST(@Evaluated1 AS VARCHAR(10)) + ', Executions created: ' + CAST(@ExecutionsCreated1 AS VARCHAR(10));
+    IF (SELECT COUNT(*) FROM dbo.AutomationTriggerQueueSummary
+        WHERE TicketId = @TicketId AND OperationId = @OperationId) <> 1
+        THROW 51013, 'Collector created more than one summary for an operation.', 1;
 
--- Verify FIRST_MATCH rule: exactly 1 execution created (Trigger 1: Priority 10) instead of both
-DECLARE @CreatedExecId UNIQUEIDENTIFIER;
-SELECT TOP 1 @CreatedExecId = ae.Id
-FROM dbo.AutomationExecutions ae
-INNER JOIN dbo.AutomationTriggers tr ON tr.Id = ae.TriggerId
-WHERE ae.TicketId = @TestTicketId AND tr.Name = 'Auto-Escalate Urgent Tickets';
+    DECLARE @Evaluated INT;
+    DECLARE @Executions INT;
+    EXEC dbo.ganymede_automationEvaluateBatch
+        @BatchSize = 1000,
+        @EvaluatedCount = @Evaluated OUTPUT,
+        @ExecutionsCreatedCount = @Executions OUTPUT,
+        @WorkerId = 'Verification-Evaluator';
 
-IF @CreatedExecId IS NOT NULL
-    PRINT 'PASS: FIRST_MATCH correctly selected priority 10 trigger (Auto-Escalate Urgent Tickets).';
-ELSE
-    PRINT 'FAIL: Priority 10 trigger not matched.';
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationEvaluations
+        WHERE QueueSummaryId = @QueueSummaryId AND IsMatch = 1 AND IsSelected = 1
+    )
+        THROW 51014, 'No matching selected evaluation was audited.', 1;
 
-IF NOT EXISTS (
-    SELECT 1 FROM dbo.AutomationExecutions ae
-    INNER JOIN dbo.AutomationTriggers tr ON tr.Id = ae.TriggerId
-    WHERE ae.TicketId = @TestTicketId AND tr.Name = 'Standard Ticket Triage'
-)
-    PRINT 'PASS: FIRST_MATCH prevented lower priority trigger (Standard Ticket Triage) from executing.';
-ELSE
-    PRINT 'FAIL: FIRST_MATCH failed, secondary trigger executed.';
+    IF EXISTS
+    (
+        SELECT 1
+        FROM dbo.AutomationEvaluations AS evaluation
+        INNER JOIN dbo.AutomationEventSettings AS setting ON setting.EventType = evaluation.EventType
+        WHERE evaluation.QueueSummaryId = @QueueSummaryId
+          AND setting.ExecutionMode = 'FIRST_MATCH'
+        GROUP BY evaluation.QueueSummaryId
+        HAVING SUM(CONVERT(INT, evaluation.IsSelected)) > 1
+    )
+        THROW 51015, 'FIRST_MATCH selected more than one trigger.', 1;
 
--- -------------------------------------------------------------------------------------------------
--- TEST 2: Worker Claim, Immutable Config, Rendered Value & Cascade Lineage (Depth 1)
--- -------------------------------------------------------------------------------------------------
-PRINT '--- [TEST 2] Worker Action Claim, Placeholder Rendering & Cascade Lineage ---';
+    DECLARE @ExecutionId UNIQUEIDENTIFIER =
+    (
+        SELECT TOP (1) Id FROM dbo.AutomationExecutions
+        WHERE QueueSummaryId = @QueueSummaryId ORDER BY CreatedAt, Id
+    );
 
--- Worker Claims Action
-DECLARE @ClaimedTable TABLE
-(
-    ActionExecutionId UNIQUEIDENTIFIER,
-    AutomationExecutionId UNIQUEIDENTIFIER,
-    ActionOrder INT,
-    ActionType VARCHAR(50),
-    ActionValue NVARCHAR(MAX),
-    TriggerId UNIQUEIDENTIFIER,
-    TicketId UNIQUEIDENTIFIER,
-    ParentExecutionId UNIQUEIDENTIFIER,
-    RootExecutionId UNIQUEIDENTIFIER,
-    ExecutionDepth INT,
-    TicketNo VARCHAR(30),
-    TicketSubject NVARCHAR(200),
-    TicketStatus VARCHAR(30),
-    TicketPriority VARCHAR(20),
-    TicketGroupId UNIQUEIDENTIFIER,
-    TicketAssignedAgentId UNIQUEIDENTIFIER,
-    RequesterContactId UNIQUEIDENTIFIER,
-    RequesterCompanyId UNIQUEIDENTIFIER
-);
+    IF @ExecutionId IS NULL
+        THROW 51016, 'Selected evaluation did not create an execution.', 1;
 
-INSERT INTO @ClaimedTable
-EXEC dbo.ganymede_automationExecutionActionClaimBatch
-    @WorkerId = 'Go-Worker-Test-1',
-    @BatchSize = 10;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationTriggerQueueAction
+        WHERE AutomationExecutionId = @ExecutionId
+          AND ExecutionTarget = 'AUTOMATION' AND ActionType = 'SET_PRIORITY'
+    )
+        THROW 51017, 'Field action was not routed to the database target.', 1;
 
-DECLARE @ClaimedCount INT = (SELECT COUNT(*) FROM @ClaimedTable WHERE AutomationExecutionId = @CreatedExecId);
-IF @ClaimedCount = 2
-    PRINT 'PASS: Worker claimed 2 actions with UPDLOCK, READPAST.';
-ELSE
-    PRINT 'FAIL: Expected 2 claimed actions, got: ' + CAST(@ClaimedCount AS VARCHAR(10));
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationTriggerQueueAction
+        WHERE AutomationExecutionId = @ExecutionId
+          AND ExecutionTarget = 'APPLICATION' AND ActionType = 'SEND_EMAIL'
+    )
+        THROW 51018, 'External action was not routed to the application target.', 1;
 
--- Complete actions specifically for @CreatedExecId
-DECLARE @Action1 UNIQUEIDENTIFIER = (
-    SELECT TOP 1 ActionExecutionId 
-    FROM @ClaimedTable 
-    WHERE AutomationExecutionId = @CreatedExecId AND ActionType = 'SET_PRIORITY'
-);
-DECLARE @Action2 UNIQUEIDENTIFIER = (
-    SELECT TOP 1 ActionExecutionId 
-    FROM @ClaimedTable 
-    WHERE AutomationExecutionId = @CreatedExecId AND ActionType = 'SEND_EMAIL'
-);
+    DECLARE @Processed INT;
+    DECLARE @Succeeded INT;
+    DECLARE @Failed INT;
+    EXEC dbo.ganymede_automationActionProcessBatch
+        @BatchSize = 1000,
+        @WorkerId = 'Verification-DB-Worker',
+        @ProcessedCount = @Processed OUTPUT,
+        @SucceededCount = @Succeeded OUTPUT,
+        @FailedCount = @Failed OUTPUT;
 
--- Worker completes Action 1
-EXEC dbo.ganymede_automationExecutionActionComplete
-    @ActionId = @Action1,
-    @Status = 'COMPLETED',
-    @RenderedValue = '{"priority": "URGENT"}';
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.Tickets WHERE Id = @TicketId AND Priority = 'URGENT'
+    )
+        THROW 51019, 'Database field action did not update the ticket.', 1;
 
--- Worker completes Action 2 with resolved placeholder
-EXEC dbo.ganymede_automationExecutionActionComplete
-    @ActionId = @Action2,
-    @Status = 'COMPLETED',
-    @RenderedValue = '{"to": "oncall@example.com", "template": "urgent_alert", "subject": "Urgent Ticket TCK-VERIFY Alert"}';
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM dbo.TicketActivityLogs
+        WHERE TicketId = @TicketId AND AutomationExecutionId = @ExecutionId
+          AND Event = 'TICKET_UPDATED'
+    )
+        THROW 51020, 'Database field action did not emit a lineage-bearing activity.', 1;
 
--- Verify ActionValue is pristine and RenderedValue is persisted
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationExecutionActions
-    WHERE Id = @Action2 
-      AND ActionValue LIKE '%{{ticket.ticketNo}}%' -- Pristine template
-      AND RenderedValue LIKE '%TCK-VERIFY%'       -- Resolved value
-      AND Status = 'COMPLETED'
-)
-    PRINT 'PASS: ActionValue is immutable; RenderedValue persisted accurately.';
-ELSE
-    PRINT 'FAIL: ActionValue mutated or RenderedValue not persisted.';
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationActionHistories
+        WHERE AutomationExecutionId = @ExecutionId
+          AND ActionType = 'SET_PRIORITY' AND Status = 'SUCCEEDED'
+    )
+        THROW 51021, 'Database action history was not written.', 1;
 
--- Verify parent execution is marked COMPLETED
-IF EXISTS (SELECT 1 FROM dbo.AutomationExecutions WHERE Id = @CreatedExecId AND Status = 'COMPLETED')
-    PRINT 'PASS: AutomationExecution transitioned to COMPLETED once all actions completed.';
-ELSE
-    PRINT 'FAIL: AutomationExecution status not updated to COMPLETED.';
+    EXEC dbo.ganymede_automationExecutionActionClaimBatch
+        @WorkerId = 'Verification-App-Worker',
+        @BatchSize = 100,
+        @LeaseSeconds = 60;
 
--- Worker simulates side effect by updating ticket with AutomationExecutionId lineage
-PRINT '--- [TEST 2.1] Simulating worker side-effect generating cascade event ---';
+    DECLARE @ApplicationActionId UNIQUEIDENTIFIER =
+    (
+        SELECT Id
+        FROM dbo.AutomationTriggerQueueAction
+        WHERE AutomationExecutionId = @ExecutionId AND ActionType = 'SEND_EMAIL'
+    );
 
-UPDATE dbo.Tickets
-SET Priority = 'URGENT', UpdatedAt = (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-WHERE Id = @TestTicketId;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationTriggerQueueAction
+        WHERE Id = @ApplicationActionId
+          AND Status = 'PROCESSING'
+          AND ClaimedBy = 'Verification-App-Worker'
+          AND AttemptCount = 1
+          AND LeaseExpiresAt > (SYSUTCDATETIME() AT TIME ZONE 'UTC')
+    )
+        THROW 51026, 'Application action was not atomically leased to the worker.', 1;
 
-EXEC dbo.ganymede_ticketActivityLogCreateForUpdatedTicket
-    @TicketId = @TestTicketId,
-    @ActorId = @TestActorId,
-    @ActorType = 'SYSTEM',
-    @OldValuesJson = '{"Priority": "MEDIUM"}',
-    @NewValuesJson = '{"Priority": "URGENT"}',
-    @Description = 'Priority escalated to URGENT by Automation Worker',
-    @PlainDescription = 'Priority escalated to URGENT by Automation Worker',
-    @AutomationExecutionId = @CreatedExecId;
+    DECLARE @RenderedEmail NVARCHAR(MAX) = N'{"ticketNo":"' + @TicketNo + N'"}';
+    EXEC dbo.ganymede_automationExecutionActionComplete
+        @ActionId = @ApplicationActionId,
+        @Status = 'SUCCEEDED',
+        @RenderedValue = @RenderedEmail,
+        @WorkerId = 'Verification-App-Worker';
 
--- Collect and check lineage
-EXEC dbo.ganymede_automationTriggerQueueCollectBatch @BatchSize = 10;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationTriggerQueueAction
+        WHERE Id = @ApplicationActionId
+          AND Status = 'SUCCEEDED'
+          AND ActionValue LIKE '%{{ticket.ticketNo}}%'
+          AND RenderedValue = @RenderedEmail
+    )
+        THROW 51027, 'Application completion did not preserve ActionValue and persist RenderedValue.', 1;
 
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationTriggerQueueSummary
-    WHERE TicketId = @TestTicketId
-      AND SourceAutomationExecutionId = @CreatedExecId
-      AND RootExecutionId = @CreatedExecId
-      AND ExecutionDepth = 1
-)
-    PRINT 'PASS: Cascade queue item preserved RootExecutionId and calculated ExecutionDepth = 1.';
-ELSE
-    PRINT 'FAIL: Cascade queue item failed lineage verification.';
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationActionHistories
+        WHERE QueueActionId = @ApplicationActionId
+          AND AttemptNumber = 1 AND Status = 'SUCCEEDED'
+    )
+        THROW 51028, 'Application action history was not written.', 1;
 
--- Clean queue for next test
-EXEC dbo.ganymede_automationEvaluateBatch @BatchSize = 10;
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM dbo.AutomationExecutions AS execution
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = execution.TicketId
+        WHERE execution.Id = @ExecutionId
+          AND execution.Status = 'COMPLETED'
+          AND ticket.CreateAutomationStatus = 'READY'
+    )
+        THROW 51029, 'Execution aggregation or create visibility finalization failed.', 1;
 
--- -------------------------------------------------------------------------------------------------
--- TEST 3: Infinite Cascade Loop Protection (Halts at MaxExecutionDepth = 10)
--- -------------------------------------------------------------------------------------------------
-PRINT '--- [TEST 3] Cascade Loop Protection (Halt at MaxExecutionDepth = 10) ---';
+    EXEC dbo.ganymede_automationTriggerQueueCollectBatch
+        @BatchSize = 2000,
+        @CollectedCount = @Collected OUTPUT;
 
-DECLARE @LoopTicketId UNIQUEIDENTIFIER = NEWID();
-INSERT INTO dbo.Tickets
-(
-    Id,
-    TicketNo,
-    RequesterContactId,
-    GroupId,
-    AssignedAgentId,
-    Subject,
-    Description,
-    PlainDescription,
-    Source,
-    Status,
-    Priority,
-    CreatedBy,
-    CreatedAt,
-    UpdatedBy,
-    UpdatedAt,
-    IsDeleted
-)
-VALUES
-(
-    @LoopTicketId,
-    'TCK-LOOP-' + FORMAT(SYSUTCDATETIME(), 'HHmmssfff'),
-    @TestContactId,
-    @TestGroupId,
-    @TestAgentId,
-    'Loop Protection Test',
-    'desc',
-    'desc',
-    'PORTAL_AGENT',
-    'WAITING_FOR_COACH',
-    'LOW',
-    'test',
-    (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-    'test',
-    (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-    0
-);
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM dbo.AutomationTriggerQueueSummary
+        WHERE TicketId = @TicketId
+          AND SourceAutomationExecutionId = @ExecutionId
+          AND RootExecutionId = @ExecutionId
+          AND ExecutionDepth = 1
+    )
+        THROW 51032, 'Cascade collector did not preserve parent/root/depth lineage.', 1;
 
--- Trigger Ping (Depth 0): Transition to WAITING_FOR_COACH
-EXEC dbo.ganymede_ticketActivityLogCreateForUpdatedTicket
-    @TicketId = @LoopTicketId,
-    @OldValuesJson = '{"status": "OPEN"}',
-    @NewValuesJson = '{"status": "WAITING_FOR_COACH"}',
-    @AutomationExecutionId = NULL;
+    DECLARE @MaxDepth INT = COALESCE
+    (
+        (SELECT TRY_CONVERT(INT, SettingValue)
+         FROM dbo.AutomationSettings WHERE SettingKey = 'MaxExecutionDepth'),
+        10
+    );
+    UPDATE dbo.AutomationExecutions SET ExecutionDepth = @MaxDepth WHERE Id = @ExecutionId;
 
-DECLARE @Step INT = 0;
-WHILE @Step <= 15
-BEGIN
-    EXEC dbo.ganymede_automationTriggerQueueCollectBatch @BatchSize = 10;
-    EXEC dbo.ganymede_automationEvaluateBatch @BatchSize = 10;
+    DECLARE @DepthOperationId UNIQUEIDENTIFIER = NEWID();
+    EXEC dbo.ganymede_ticketActivityLogCreateForUpdatedTicket
+        @TicketId = @TicketId,
+        @ActorType = 'SYSTEM',
+        @OldValuesJson = N'{"subject":"before-depth-check"}',
+        @NewValuesJson = N'{"subject":"after-depth-check"}',
+        @AutomationExecutionId = @ExecutionId,
+        @OperationId = @DepthOperationId;
 
-    -- If an execution was created, claim and simulate next ping-pong step
-    DECLARE @LoopActionId UNIQUEIDENTIFIER = NULL;
-    DECLARE @LoopExecId UNIQUEIDENTIFIER = NULL;
-    DECLARE @LoopActionVal NVARCHAR(MAX) = NULL;
+    EXEC dbo.ganymede_automationTriggerQueueCollectBatch
+        @BatchSize = 2000,
+        @CollectedCount = @Collected OUTPUT;
+    EXEC dbo.ganymede_automationEvaluateBatch
+        @BatchSize = 1000,
+        @EvaluatedCount = @Evaluated OUTPUT,
+        @ExecutionsCreatedCount = @Executions OUTPUT,
+        @WorkerId = 'Verification-Depth-Evaluator';
 
-    SELECT TOP 1
-        @LoopActionId = act.Id,
-        @LoopExecId = act.AutomationExecutionId,
-        @LoopActionVal = act.ActionValue
-    FROM dbo.AutomationExecutionActions act
-    INNER JOIN dbo.AutomationExecutions ae ON ae.Id = act.AutomationExecutionId
-    WHERE ae.TicketId = @LoopTicketId AND act.Status = 'PENDING'
-    ORDER BY act.CreatedAt ASC;
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM dbo.AutomationTriggerQueueSummary
+        WHERE TicketId = @TicketId AND OperationId = @DepthOperationId
+          AND ExecutionDepth = @MaxDepth + 1
+          AND Status = 'SKIPPED' AND SkipReason = 'SKIPPED_MAX_DEPTH'
+    )
+        THROW 51033, 'Cascade maximum-depth guard did not halt the descendant.', 1;
 
-    IF @LoopActionId IS NULL
-        BREAK; -- Loop halted!
+    DECLARE @AllMatchOperationId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @AllMatchTrigger1 UNIQUEIDENTIFIER = NEWID();
+    DECLARE @AllMatchTrigger2 UNIQUEIDENTIFIER = NEWID();
 
-    -- Claim & complete
-    EXEC dbo.ganymede_automationExecutionActionComplete 
-        @ActionId = @LoopActionId, 
-        @Status = 'COMPLETED',
-        @RenderedValue = @LoopActionVal;
+    INSERT dbo.AutomationEventSettings (EventType, ExecutionMode, IsActive)
+    VALUES ('VERIFY_ALL_MATCH', 'ALL_MATCH', 1);
+    INSERT dbo.AutomationTriggers (Id, Name, EventType, Priority, IsActive)
+    VALUES
+        (@AllMatchTrigger1, 'Verification ALL_MATCH A', 'VERIFY_ALL_MATCH', 10, 1),
+        (@AllMatchTrigger2, 'Verification ALL_MATCH B', 'VERIFY_ALL_MATCH', 20, 1);
+    INSERT dbo.TicketActivityLogs
+    (
+        TicketId, Event, ActorType, ActorId, OldValue, NewValue,
+        Description, PlainDescription, AutomationExecutionId, OperationId, CreatedAt
+    )
+    VALUES
+    (
+        @TicketId, 'VERIFY_ALL_MATCH', 'SYSTEM', NULL, NULL, N'{}',
+        'ALL_MATCH verification', 'ALL_MATCH verification', NULL,
+        @AllMatchOperationId, SYSUTCDATETIME() AT TIME ZONE 'UTC'
+    );
 
-    -- Update ticket and insert next activity log with lineage
-    DECLARE @NewStatusVal VARCHAR(50) = JSON_VALUE(@LoopActionVal, '$.status');
+    EXEC dbo.ganymede_automationTriggerQueueCollectBatch
+        @BatchSize = 2000,
+        @CollectedCount = @Collected OUTPUT;
+    EXEC dbo.ganymede_automationEvaluateBatch
+        @BatchSize = 1000,
+        @EvaluatedCount = @Evaluated OUTPUT,
+        @ExecutionsCreatedCount = @Executions OUTPUT,
+        @WorkerId = 'Verification-AllMatch-Evaluator';
+
+    IF
+    (
+        SELECT COUNT(*)
+        FROM dbo.AutomationEvaluations AS evaluation
+        INNER JOIN dbo.AutomationTriggerQueueSummary AS summary
+            ON summary.Id = evaluation.QueueSummaryId
+        WHERE summary.OperationId = @AllMatchOperationId
+          AND evaluation.IsMatch = 1 AND evaluation.IsSelected = 1
+    ) <> 2
+        THROW 51034, 'ALL_MATCH did not select every matching trigger.', 1;
 
     UPDATE dbo.Tickets
-    SET Status = @NewStatusVal, UpdatedAt = (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-    WHERE Id = @LoopTicketId;
+    SET Status = 'PENDING',
+        StatusChangedAt = DATEADD(HOUR, -30, SYSUTCDATETIME() AT TIME ZONE 'UTC')
+    WHERE Id = @TicketId;
 
-    EXEC dbo.ganymede_ticketActivityLogCreateForUpdatedTicket
-        @TicketId = @LoopTicketId,
-        @OldValuesJson = '{"status": "PREV"}',
-        @NewValuesJson = @LoopActionVal,
-        @AutomationExecutionId = @LoopExecId;
+    DECLARE @ActivityCountBeforeTimeScan BIGINT = (SELECT COUNT_BIG(*) FROM dbo.TicketActivityLogs);
+    DECLARE @TimeQueued INT;
+    DECLARE @Bucket VARCHAR(100) = 'VERIFY_' + REPLACE(CONVERT(VARCHAR(36), NEWID()), '-', '');
+    EXEC dbo.ganymede_automationTimeTriggerScanBatch
+        @EvaluationBucket = @Bucket,
+        @BatchSize = 1000,
+        @QueuedCount = @TimeQueued OUTPUT;
 
-    SET @Step = @Step + 1;
-END;
+    IF @TimeQueued = 0
+        THROW 51025, 'Time scanner did not produce an eligible candidate.', 1;
 
--- Verify loop halted with SKIPPED_MAX_DEPTH
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationTriggerQueueSummary
-    WHERE TicketId = @LoopTicketId
-      AND Status = 'SKIPPED'
-      AND SkipReason = 'SKIPPED_MAX_DEPTH'
-)
-    PRINT 'PASS: Cascade loop halted gracefully with Status = SKIPPED and SkipReason = SKIPPED_MAX_DEPTH.';
-ELSE
-    PRINT 'FAIL: Cascade loop did not halt with SKIPPED_MAX_DEPTH.';
+    IF @ActivityCountBeforeTimeScan <> (SELECT COUNT_BIG(*) FROM dbo.TicketActivityLogs)
+        THROW 51022, 'Time scanner polluted TicketActivityLogs.', 1;
 
-DECLARE @MaxDepthObserved INT = (
-    SELECT MAX(ExecutionDepth) 
-    FROM dbo.AutomationExecutions 
-    WHERE TicketId = @LoopTicketId
+    DECLARE @TimeQueuedAgain INT;
+    EXEC dbo.ganymede_automationTimeTriggerScanBatch
+        @EvaluationBucket = @Bucket,
+        @BatchSize = 1000,
+        @QueuedCount = @TimeQueuedAgain OUTPUT;
+
+    IF EXISTS
+    (
+        SELECT TicketId, CandidateTriggerId, EvaluationBucket
+        FROM dbo.AutomationTriggerQueueSummary
+        WHERE QueueSourceType = 'TIME_TRIGGER' AND EvaluationBucket = @Bucket
+        GROUP BY TicketId, CandidateTriggerId, EvaluationBucket
+        HAVING COUNT(*) > 1
+    )
+        THROW 51023, 'Time scanner created a duplicate inside an evaluation bucket.', 1;
+
+    ROLLBACK TRANSACTION;
+    PRINT 'PASS: transactional smoke verification completed; all writes rolled back.';
+END TRY
+BEGIN CATCH
+    IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+GO
+
+-- Read-only operational checks. Empty result sets are healthy.
+SELECT action.Id, action.AutomationExecutionId, action.ClaimedBy, action.LeaseExpiresAt
+FROM dbo.AutomationTriggerQueueAction AS action
+WHERE action.Status = 'PROCESSING'
+  AND action.LeaseExpiresAt < (SYSUTCDATETIME() AT TIME ZONE 'UTC');
+
+SELECT summary.Id, summary.TicketId, summary.ClaimedBy, summary.LeaseExpiresAt
+FROM dbo.AutomationTriggerQueueSummary AS summary
+WHERE summary.Status = 'PROCESSING'
+  AND summary.LeaseExpiresAt < (SYSUTCDATETIME() AT TIME ZONE 'UTC');
+
+SELECT execution.TicketId, execution.RootExecutionId, MAX(execution.ExecutionDepth) AS MaximumDepth
+FROM dbo.AutomationExecutions AS execution
+GROUP BY execution.TicketId, execution.RootExecutionId
+HAVING MAX(execution.ExecutionDepth) > COALESCE
+(
+    (SELECT TRY_CONVERT(INT, SettingValue)
+     FROM dbo.AutomationSettings WHERE SettingKey = 'MaxExecutionDepth'),
+    10
 );
-PRINT 'Max execution depth created before halting: ' + CAST(ISNULL(@MaxDepthObserved, 0) AS VARCHAR(10)) + ' (Limit: 10)';
-
-IF @MaxDepthObserved <= 10
-    PRINT 'PASS: No executions created beyond MaxExecutionDepth = 10.';
-ELSE
-    PRINT 'FAIL: Executions created beyond depth limit.';
-
--- -------------------------------------------------------------------------------------------------
--- TEST 4: Time Trigger Purity & Idempotency
--- -------------------------------------------------------------------------------------------------
-PRINT '--- [TEST 4] Time Trigger Purity & Idempotency ---';
-
-DECLARE @ActivityCountBefore INT = (SELECT COUNT(*) FROM dbo.TicketActivityLogs);
-
--- Set test ticket status to PENDING and StatusChangedAt to 30 hours ago
-UPDATE dbo.Tickets
-SET Status = 'PENDING',
-    StatusChangedAt = DATEADD(HOUR, -30, SYSUTCDATETIME() AT TIME ZONE 'UTC')
-WHERE Id = @TestTicketId;
-
-DECLARE @TimeBucket VARCHAR(100) = 'TT_TEST_BUCKET_' + FORMAT(SYSUTCDATETIME(), 'yyyyMMdd_HH');
-
--- Scan 1st time
-DECLARE @QueuedTT INT = 0;
-EXEC dbo.ganymede_automationTimeTriggerScanBatch
-    @EvaluationBucket = @TimeBucket,
-    @BatchSize = 100,
-    @QueuedCount = @QueuedTT OUTPUT;
-
-PRINT 'Time triggers queued (Scan 1): ' + CAST(@QueuedTT AS VARCHAR(10));
-
--- Verify NO activity logs inserted
-DECLARE @ActivityCountAfter INT = (SELECT COUNT(*) FROM dbo.TicketActivityLogs);
-IF @ActivityCountBefore = @ActivityCountAfter
-    PRINT 'PASS (Purity): Time Trigger Scanner generated queue items WITHOUT inserting fake rows into TicketActivityLogs.';
-ELSE
-    PRINT 'FAIL: Time Trigger Scanner created activity logs (violated Hard Constraint #4).';
-
--- Verify item is in queue
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationTriggerQueueSummary
-    WHERE TicketId = @TestTicketId
-      AND QueueSourceType = 'TIME_TRIGGER'
-      AND EvaluationBucket = @TimeBucket
-)
-    PRINT 'PASS: Time Trigger item created in AutomationTriggerQueueSummary.';
-ELSE
-    PRINT 'FAIL: Time Trigger item not found in queue.';
-
--- Scan 2nd time with SAME bucket (Idempotency test)
-DECLARE @QueuedTT2 INT = 0;
-EXEC dbo.ganymede_automationTimeTriggerScanBatch
-    @EvaluationBucket = @TimeBucket,
-    @BatchSize = 100,
-    @QueuedCount = @QueuedTT2 OUTPUT;
-
-PRINT 'Time triggers queued (Scan 2 with same bucket): ' + CAST(@QueuedTT2 AS VARCHAR(10));
-
-IF @QueuedTT2 = 0
-    PRINT 'PASS (Idempotency): Re-running time trigger in same bucket produced 0 duplicate queue items.';
-ELSE
-    PRINT 'FAIL: Time Trigger is not idempotent, created duplicate queue items.';
-
--- Evaluate Time Trigger queue item
-EXEC dbo.ganymede_automationEvaluateBatch @BatchSize = 10;
-
-IF EXISTS (
-    SELECT 1 FROM dbo.AutomationExecutions ae
-    INNER JOIN dbo.AutomationTriggers tr ON tr.Id = ae.TriggerId
-    WHERE ae.TicketId = @TestTicketId AND tr.Name = 'Auto-Close Inactive Pending Tickets'
-)
-    PRINT 'PASS: Evaluator executed Auto-Close Inactive Pending Tickets time trigger.';
-ELSE
-    PRINT 'FAIL: Evaluator did not trigger time-based rule.';
-
--- -------------------------------------------------------------------------------------------------
--- SUMMARY AUDIT TABLE
--- -------------------------------------------------------------------------------------------------
-PRINT '================================================================================';
-PRINT 'AUTOMATION ENGINE AUDIT SUMMARY';
-PRINT '================================================================================';
-
-SELECT 
-    t.TicketNo,
-    qs.QueueSourceType,
-    qs.ExecutionDepth,
-    qs.Status AS QueueStatus,
-    qs.SkipReason AS QueueSkipReason,
-    tr.Name AS TriggerName,
-    ae.Status AS ExecutionStatus,
-    ae.RootExecutionId,
-    act.ActionType,
-    act.Status AS ActionStatus,
-    LEFT(act.ActionValue, 40) AS ActionValueSnippet,
-    LEFT(act.RenderedValue, 40) AS RenderedValueSnippet
-FROM dbo.Tickets t
-LEFT JOIN dbo.AutomationTriggerQueueSummary qs ON qs.TicketId = t.Id
-LEFT JOIN dbo.AutomationExecutions ae ON ae.QueueSummaryId = qs.Id
-LEFT JOIN dbo.AutomationTriggers tr ON tr.Id = ae.TriggerId
-LEFT JOIN dbo.AutomationExecutionActions act ON act.AutomationExecutionId = ae.Id
-WHERE t.Id IN (@TestTicketId, @LoopTicketId)
-ORDER BY t.TicketNo, qs.Id, ae.CreatedAt, act.ActionOrder;
 GO

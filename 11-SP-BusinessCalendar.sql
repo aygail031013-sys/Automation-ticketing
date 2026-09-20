@@ -26,16 +26,17 @@ BEGIN
     END;
 
     -- Resolve Calendar
-    DECLARE @CalendarId UNIQUEIDENTIFIER = @BusinessCalendarId;
+    DECLARE @RequestedCalendarId UNIQUEIDENTIFIER = @BusinessCalendarId;
+    DECLARE @CalendarId UNIQUEIDENTIFIER = NULL;
     DECLARE @Timezone VARCHAR(50) = 'UTC';
 
-    IF @CalendarId IS NOT NULL
+    IF @RequestedCalendarId IS NOT NULL
     BEGIN
         SELECT TOP 1 
             @CalendarId = Id,
             @Timezone = ISNULL(Timezone, 'UTC')
-        FROM dbo.BusinessCalendars WITH (NOLOCK)
-        WHERE Id = @CalendarId AND IsActive = 1;
+        FROM dbo.BusinessCalendars
+        WHERE Id = @RequestedCalendarId AND IsActive = 1;
     END;
 
     -- If not specified or not found, resolve to default active calendar
@@ -44,7 +45,7 @@ BEGIN
         SELECT TOP 1 
             @CalendarId = Id,
             @Timezone = ISNULL(Timezone, 'UTC')
-        FROM dbo.BusinessCalendars WITH (NOLOCK)
+        FROM dbo.BusinessCalendars
         WHERE IsDefault = 1 AND IsActive = 1;
     END;
 
@@ -54,7 +55,7 @@ BEGIN
         SELECT TOP 1 
             @CalendarId = Id,
             @Timezone = ISNULL(Timezone, 'UTC')
-        FROM dbo.BusinessCalendars WITH (NOLOCK)
+        FROM dbo.BusinessCalendars
         WHERE IsActive = 1
         ORDER BY CreatedAt ASC;
     END;
@@ -95,7 +96,7 @@ BEGIN
     -- Check if date is a configured Holiday
     IF EXISTS (
         SELECT 1 
-        FROM dbo.BusinessCalendarHolidays WITH (NOLOCK)
+        FROM dbo.BusinessCalendarHolidays
         WHERE CalendarId = @CalendarId
           AND HolidayDate = @LocalDate
     )
@@ -110,7 +111,7 @@ BEGIN
         -- Check if day & time fall within working schedule
         IF EXISTS (
             SELECT 1 
-            FROM dbo.BusinessCalendarSchedules WITH (NOLOCK)
+            FROM dbo.BusinessCalendarSchedules
             WHERE CalendarId = @CalendarId
               AND DayOfWeek = @DayOfWeek
               AND IsWorkingDay = 1

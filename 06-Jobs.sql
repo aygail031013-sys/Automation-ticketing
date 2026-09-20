@@ -16,6 +16,7 @@ CREATE OR ALTER PROCEDURE dbo.ganymede_automationRunScheduler
     @RunTimeTriggerScanner BIT = 1,
     @RunCollector BIT = 1,
     @RunEvaluator BIT = 1,
+    @RunAutomationActions BIT = 1,
     @BatchSize INT = 100
 AS
 BEGIN
@@ -25,6 +26,9 @@ BEGIN
     DECLARE @Evaluated INT = 0;
     DECLARE @ExecutionsCreated INT = 0;
     DECLARE @TimeTriggersQueued INT = 0;
+    DECLARE @ActionsProcessed INT = 0;
+    DECLARE @ActionsSucceeded INT = 0;
+    DECLARE @ActionsFailed INT = 0;
 
     -- Step 1: Time Trigger Scanner
     IF @RunTimeTriggerScanner = 1
@@ -51,11 +55,24 @@ BEGIN
             @ExecutionsCreatedCount = @ExecutionsCreated OUTPUT;
     END;
 
+    -- Step 4: database-owned field actions. Application-owned actions are claimed by app workers.
+    IF @RunAutomationActions = 1
+    BEGIN
+        EXEC dbo.ganymede_automationActionProcessBatch
+            @BatchSize = @BatchSize,
+            @ProcessedCount = @ActionsProcessed OUTPUT,
+            @SucceededCount = @ActionsSucceeded OUTPUT,
+            @FailedCount = @ActionsFailed OUTPUT;
+    END;
+
     SELECT
         @TimeTriggersQueued AS TimeTriggersQueued,
         @Collected AS ItemsCollected,
         @Evaluated AS ItemsEvaluated,
-        @ExecutionsCreated AS ExecutionsCreated;
+        @ExecutionsCreated AS ExecutionsCreated,
+        @ActionsProcessed AS AutomationActionsProcessed,
+        @ActionsSucceeded AS AutomationActionsSucceeded,
+        @ActionsFailed AS AutomationActionsFailed;
 END;
 GO
 
@@ -202,6 +219,43 @@ BEGIN TRY
 END TRY
 BEGIN CATCH
     PRINT 'Notice: SQL Server Agent Scanner job registration skipped or not permitted: ' + ERROR_MESSAGE();
+END CATCH;
+GO
+
+BEGIN TRY
+    -- 2.4 Job: OneDesk Automation - DB Field Action Processor (Every 10 seconds)
+    IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = 'OneDesk_Automation_DBActionProcessor')
+    BEGIN
+        EXEC sp_delete_job @job_name = 'OneDesk_Automation_DBActionProcessor';
+    END;
+
+    DECLARE @ActionJobId BINARY(16);
+    EXEC sp_add_job
+        @job_name = 'OneDesk_Automation_DBActionProcessor',
+        @enabled = 1,
+        @description = 'Atomically claims and executes database-owned ticket field actions',
+        @job_id = @ActionJobId OUTPUT;
+
+    EXEC sp_add_jobstep
+        @job_name = 'OneDesk_Automation_DBActionProcessor',
+        @step_name = 'Run_DB_Action_Processor',
+        @subsystem = 'TSQL',
+        @command = 'EXEC dbo.ganymede_automationActionProcessBatch @BatchSize = 100;',
+        @database_name = 'OneDeskDb',
+        @on_success_action = 1;
+
+    EXEC sp_attach_schedule
+        @job_name = 'OneDesk_Automation_DBActionProcessor',
+        @schedule_name = 'Schedule_Every_10_Seconds';
+
+    EXEC sp_add_jobserver
+        @job_name = 'OneDesk_Automation_DBActionProcessor',
+        @server_name = '(local)';
+
+    PRINT 'SQL Agent Job: OneDesk_Automation_DBActionProcessor registered successfully.';
+END TRY
+BEGIN CATCH
+    PRINT 'Notice: SQL Server Agent DB action job registration skipped or not permitted: ' + ERROR_MESSAGE();
 END CATCH;
 GO
 

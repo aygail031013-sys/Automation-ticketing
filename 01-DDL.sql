@@ -307,7 +307,7 @@ END;
 GO
 
 -- -------------------------------------------------------------------------------------------------
--- 7. Execution Tables: AutomationExecutions and AutomationExecutionActions
+-- 7. Durable execution occurrence table
 -- -------------------------------------------------------------------------------------------------
 IF OBJECT_ID('dbo.AutomationExecutions', 'U') IS NULL
 BEGIN
@@ -332,28 +332,412 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('dbo.AutomationExecutionActions', 'U') IS NULL
+-- -------------------------------------------------------------------------------------------------
+-- 8. Flow-guide compatibility migration
+--
+-- The original v1 draft combined execution and action state. The flow guide deliberately keeps
+-- queue state, durable evaluation audit, selected trigger state, executable action state, and final
+-- action history separate.  The following migration is safe to run both for a new database and over
+-- an earlier v1 draft.
+-- -------------------------------------------------------------------------------------------------
+
+IF COL_LENGTH('dbo.TicketActivityLogs', 'OperationId') IS NULL
 BEGIN
-    CREATE TABLE dbo.AutomationExecutionActions
+    ALTER TABLE dbo.TicketActivityLogs ADD OperationId UNIQUEIDENTIFIER NULL;
+END;
+GO
+
+IF COL_LENGTH('dbo.Tickets', 'CreateAutomationStatus') IS NULL
+BEGIN
+    ALTER TABLE dbo.Tickets ADD CreateAutomationStatus VARCHAR(20) NOT NULL
+        CONSTRAINT DF_Tickets_CreateAutomationStatus DEFAULT ('READY');
+END;
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.check_constraints
+    WHERE parent_object_id = OBJECT_ID('dbo.Tickets')
+      AND name = 'CK_Tickets_CreateAutomationStatus'
+)
+BEGIN
+    ALTER TABLE dbo.Tickets ADD CONSTRAINT CK_Tickets_CreateAutomationStatus
+        CHECK (CreateAutomationStatus IN ('PENDING', 'READY'));
+END;
+GO
+
+IF COL_LENGTH('dbo.AutomationTriggerActions', 'ExecutionTarget') IS NULL
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerActions ADD ExecutionTarget VARCHAR(20) NULL;
+END;
+GO
+
+UPDATE dbo.AutomationTriggerActions
+SET ExecutionTarget = CASE
+        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'SET_AGENT',
+                            'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD')
+            THEN 'AUTOMATION'
+        ELSE 'APPLICATION'
+    END
+WHERE ExecutionTarget IS NULL;
+GO
+
+IF EXISTS
+(
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.AutomationTriggerActions')
+      AND name = 'ExecutionTarget' AND is_nullable = 1
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerActions ALTER COLUMN ExecutionTarget VARCHAR(20) NOT NULL;
+END;
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.default_constraints
+    WHERE parent_object_id = OBJECT_ID('dbo.AutomationTriggerActions')
+      AND name = 'DF_AutomationTriggerActions_ExecutionTarget'
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerActions ADD
+        CONSTRAINT DF_AutomationTriggerActions_ExecutionTarget DEFAULT ('APPLICATION') FOR ExecutionTarget;
+END;
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.check_constraints
+    WHERE parent_object_id = OBJECT_ID('dbo.AutomationTriggerActions')
+      AND name = 'CK_AutomationTriggerActions_ExecutionTarget'
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerActions ADD
+        CONSTRAINT CK_AutomationTriggerActions_ExecutionTarget CHECK (ExecutionTarget IN ('AUTOMATION', 'APPLICATION'));
+END;
+GO
+
+IF COL_LENGTH('dbo.AutomationTriggerActions', 'TargetField') IS NULL
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerActions ADD TargetField VARCHAR(100) NULL;
+END;
+GO
+
+UPDATE dbo.AutomationTriggerActions
+SET TargetField = CASE ActionType
+        WHEN 'SET_STATUS' THEN 'status'
+        WHEN 'SET_PRIORITY' THEN 'priority'
+        WHEN 'SET_GROUP' THEN 'groupId'
+        WHEN 'SET_AGENT' THEN 'assignedAgentId'
+        WHEN 'SET_TYPE' THEN 'typeOptionId'
+        WHEN 'SET_DUE_DATE' THEN 'dueDate'
+        ELSE TargetField
+    END
+WHERE TargetField IS NULL;
+GO
+
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'EventType') IS NULL
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD EventType VARCHAR(50) NULL;
+END;
+GO
+
+UPDATE dbo.AutomationTriggerQueueSummary SET EventType = 'UNKNOWN' WHERE EventType IS NULL;
+GO
+
+IF EXISTS
+(
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.AutomationTriggerQueueSummary')
+      AND name = 'EventType' AND is_nullable = 1
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ALTER COLUMN EventType VARCHAR(50) NOT NULL;
+END;
+GO
+
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'OperationId') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD OperationId UNIQUEIDENTIFIER NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'ClaimedBy') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD ClaimedBy VARCHAR(100) NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'ClaimedAt') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD ClaimedAt DATETIMEOFFSET NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'LeaseExpiresAt') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD LeaseExpiresAt DATETIMEOFFSET NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueSummary', 'ErrorMessage') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueSummary ADD ErrorMessage NVARCHAR(2000) NULL;
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID('dbo.AutomationTriggerQueueSummary')
+      AND name = 'UQ_AutomationTriggerQueueSummary_ActivityOperation'
+)
+BEGIN
+    CREATE UNIQUE NONCLUSTERED INDEX UQ_AutomationTriggerQueueSummary_ActivityOperation
+    ON dbo.AutomationTriggerQueueSummary (TicketId, OperationId)
+    WHERE QueueSourceType = 'ACTIVITY_LOG' AND OperationId IS NOT NULL;
+END;
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID('dbo.AutomationTriggerQueueSource')
+      AND name = 'UQ_AutomationTriggerQueueSource_ActivityLogId'
+)
+BEGIN
+    CREATE UNIQUE NONCLUSTERED INDEX UQ_AutomationTriggerQueueSource_ActivityLogId
+    ON dbo.AutomationTriggerQueueSource (TicketActivityLogId);
+END;
+GO
+
+IF COL_LENGTH('dbo.AutomationTriggerQueueRule', 'ActualFromValue') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueRule ADD ActualFromValue NVARCHAR(MAX) NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueRule', 'ActualToValue') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueRule ADD ActualToValue NVARCHAR(MAX) NULL;
+GO
+IF COL_LENGTH('dbo.AutomationTriggerQueueRule', 'ExpectedValue') IS NULL
+    ALTER TABLE dbo.AutomationTriggerQueueRule ADD ExpectedValue NVARCHAR(MAX) NULL;
+GO
+
+-- Durable audit: one row for every candidate trigger, whether or not it matched or was selected.
+IF OBJECT_ID('dbo.AutomationEvaluations', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationEvaluations
     (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
-        AutomationExecutionId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationExecutions(Id) ON DELETE CASCADE,
-        ActionOrder INT NOT NULL DEFAULT 1,
-        ActionType VARCHAR(50) NOT NULL,
-        ActionValue NVARCHAR(MAX) NOT NULL, -- Immutable snapshot from AutomationTriggerActions
-        RenderedValue NVARCHAR(MAX) NULL, -- Resolved value populated by Application Worker
-        RenderedAt DATETIMEOFFSET NULL,
-        Status VARCHAR(20) NOT NULL DEFAULT 'PENDING', -- PENDING, CLAIMED, COMPLETED, FAILED
-        ClaimedAt DATETIMEOFFSET NULL,
-        ClaimedBy VARCHAR(100) NULL,
-        CompletedAt DATETIMEOFFSET NULL,
-        ErrorMessage NVARCHAR(MAX) NULL,
-        CreatedAt DATETIMEOFFSET NOT NULL DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-        CONSTRAINT CK_AutomationExecutionActions_Status CHECK (Status IN ('PENDING', 'CLAIMED', 'COMPLETED', 'FAILED'))
+        Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_AutomationEvaluations PRIMARY KEY,
+        QueueSummaryId BIGINT NOT NULL REFERENCES dbo.AutomationTriggerQueueSummary(Id),
+        TicketId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.Tickets(Id),
+        TriggerId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggers(Id),
+        EventType VARCHAR(50) NOT NULL,
+        ExecutionMode VARCHAR(20) NOT NULL,
+        SortOrder INT NOT NULL,
+        IsMatch BIT NOT NULL,
+        IsSelected BIT NOT NULL,
+        EvaluatedAt DATETIMEOFFSET NOT NULL CONSTRAINT DF_AutomationEvaluations_EvaluatedAt
+            DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
+        CONSTRAINT UQ_AutomationEvaluations_Queue_Trigger UNIQUE (QueueSummaryId, TriggerId)
     );
 
-    CREATE NONCLUSTERED INDEX IX_AutomationExecutionActions_Status_Claim
-    ON dbo.AutomationExecutionActions (Status, ActionOrder ASC)
-    INCLUDE (AutomationExecutionId, ActionType);
+    CREATE INDEX IX_AutomationEvaluations_Ticket_EvaluatedAt
+        ON dbo.AutomationEvaluations (TicketId, EvaluatedAt DESC)
+        INCLUDE (TriggerId, EventType, IsMatch, IsSelected);
+    CREATE INDEX IX_AutomationEvaluations_Retention
+        ON dbo.AutomationEvaluations (EvaluatedAt, Id);
 END;
+GO
+
+IF OBJECT_ID('dbo.AutomationEvaluationBlocks', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationEvaluationBlocks
+    (
+        Id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_AutomationEvaluationBlocks PRIMARY KEY,
+        EvaluationId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationEvaluations(Id),
+        TriggerBlockId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggerBlocks(Id),
+        LogicalOperator VARCHAR(10) NOT NULL,
+        IsMatch BIT NOT NULL,
+        EvaluatedAt DATETIMEOFFSET NOT NULL CONSTRAINT DF_AutomationEvaluationBlocks_EvaluatedAt
+            DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
+        CONSTRAINT UQ_AutomationEvaluationBlocks_Evaluation_Block UNIQUE (EvaluationId, TriggerBlockId)
+    );
+
+    CREATE INDEX IX_AutomationEvaluationBlocks_Retention
+        ON dbo.AutomationEvaluationBlocks (EvaluatedAt, Id);
+END;
+GO
+
+IF OBJECT_ID('dbo.AutomationEvaluationRules', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationEvaluationRules
+    (
+        Id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_AutomationEvaluationRules PRIMARY KEY,
+        EvaluationId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationEvaluations(Id),
+        TriggerBlockId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggerBlocks(Id),
+        RuleId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggerRules(Id),
+        FieldSource VARCHAR(20) NOT NULL,
+        FieldCode VARCHAR(100) NOT NULL,
+        Operator VARCHAR(50) NOT NULL,
+        FromValue NVARCHAR(MAX) NULL,
+        ToValue NVARCHAR(MAX) NULL,
+        ExpectedValue NVARCHAR(MAX) NULL,
+        IsMatch BIT NOT NULL,
+        EvaluatedAt DATETIMEOFFSET NOT NULL CONSTRAINT DF_AutomationEvaluationRules_EvaluatedAt
+            DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
+        CONSTRAINT UQ_AutomationEvaluationRules_Evaluation_Rule UNIQUE (EvaluationId, RuleId)
+    );
+
+    CREATE INDEX IX_AutomationEvaluationRules_Evaluation
+        ON dbo.AutomationEvaluationRules (EvaluationId, TriggerBlockId, IsMatch);
+    CREATE INDEX IX_AutomationEvaluationRules_Retention
+        ON dbo.AutomationEvaluationRules (EvaluatedAt, Id);
+END;
+GO
+
+IF OBJECT_ID('dbo.AutomationTriggerQueueTrigger', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationTriggerQueueTrigger
+    (
+        Id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_AutomationTriggerQueueTrigger PRIMARY KEY,
+        QueueSummaryId BIGINT NOT NULL REFERENCES dbo.AutomationTriggerQueueSummary(Id),
+        EvaluationId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationEvaluations(Id),
+        TriggerId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggers(Id),
+        AutomationExecutionId UNIQUEIDENTIFIER NULL,
+        SortOrder INT NOT NULL,
+        Status VARCHAR(20) NOT NULL CONSTRAINT DF_AutomationTriggerQueueTrigger_Status DEFAULT ('SELECTED'),
+        CreatedAt DATETIMEOFFSET NOT NULL CONSTRAINT DF_AutomationTriggerQueueTrigger_CreatedAt
+            DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
+        CONSTRAINT CK_AutomationTriggerQueueTrigger_Status CHECK (Status IN ('SELECTED', 'DISPATCHED')),
+        CONSTRAINT UQ_AutomationTriggerQueueTrigger_Queue_Trigger UNIQUE (QueueSummaryId, TriggerId)
+    );
+
+    CREATE INDEX IX_AutomationTriggerQueueTrigger_Status
+        ON dbo.AutomationTriggerQueueTrigger (Status, Id);
+END;
+GO
+
+IF OBJECT_ID('dbo.AutomationTriggerQueueAction', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationTriggerQueueAction
+    (
+        Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_AutomationTriggerQueueAction PRIMARY KEY,
+        AutomationExecutionId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationExecutions(Id),
+        TriggerActionId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggerActions(Id),
+        TicketId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.Tickets(Id),
+        ActionSequence INT NOT NULL,
+        ActionType VARCHAR(50) NOT NULL,
+        ExecutionTarget VARCHAR(20) NOT NULL,
+        TargetField VARCHAR(100) NULL,
+        ActionValue NVARCHAR(MAX) NOT NULL,
+        RenderedValue NVARCHAR(MAX) NULL,
+        RenderedAt DATETIMEOFFSET NULL,
+        Status VARCHAR(20) NOT NULL CONSTRAINT DF_AutomationTriggerQueueAction_Status DEFAULT ('READY'),
+        AttemptCount INT NOT NULL CONSTRAINT DF_AutomationTriggerQueueAction_AttemptCount DEFAULT (0),
+        ClaimedBy VARCHAR(100) NULL,
+        ClaimedAt DATETIMEOFFSET NULL,
+        LeaseExpiresAt DATETIMEOFFSET NULL,
+        CompletedAt DATETIMEOFFSET NULL,
+        LastError NVARCHAR(2000) NULL,
+        CreatedAt DATETIMEOFFSET NOT NULL CONSTRAINT DF_AutomationTriggerQueueAction_CreatedAt
+            DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
+        CONSTRAINT CK_AutomationTriggerQueueAction_Target CHECK (ExecutionTarget IN ('AUTOMATION', 'APPLICATION')),
+        CONSTRAINT CK_AutomationTriggerQueueAction_Status CHECK (Status IN ('READY', 'PROCESSING', 'SUCCEEDED', 'FAILED')),
+        CONSTRAINT CK_AutomationTriggerQueueAction_AttemptCount CHECK (AttemptCount >= 0),
+        CONSTRAINT UQ_AutomationTriggerQueueAction_Execution_Sequence UNIQUE (AutomationExecutionId, ActionSequence)
+    );
+
+    CREATE INDEX IX_AutomationTriggerQueueAction_Claim
+        ON dbo.AutomationTriggerQueueAction (ExecutionTarget, Status, LeaseExpiresAt, CreatedAt)
+        INCLUDE (AutomationExecutionId, TicketId, ActionSequence, AttemptCount, ActionType);
+END;
+GO
+
+IF OBJECT_ID('dbo.AutomationActionHistories', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.AutomationActionHistories
+    (
+        Id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_AutomationActionHistories PRIMARY KEY,
+        QueueActionId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationTriggerQueueAction(Id),
+        AutomationExecutionId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.AutomationExecutions(Id),
+        TicketId UNIQUEIDENTIFIER NOT NULL REFERENCES dbo.Tickets(Id),
+        AttemptNumber INT NOT NULL,
+        ActionType VARCHAR(50) NOT NULL,
+        ExecutionTarget VARCHAR(20) NOT NULL,
+        TargetField VARCHAR(100) NULL,
+        ConfiguredValue NVARCHAR(MAX) NOT NULL,
+        ResolvedValue NVARCHAR(MAX) NULL,
+        FromValue NVARCHAR(MAX) NULL,
+        ToValue NVARCHAR(MAX) NULL,
+        Status VARCHAR(20) NOT NULL,
+        WorkerId VARCHAR(100) NULL,
+        ErrorMessage NVARCHAR(2000) NULL,
+        StartedAt DATETIMEOFFSET NULL,
+        CompletedAt DATETIMEOFFSET NOT NULL,
+        CONSTRAINT CK_AutomationActionHistories_Status CHECK (Status IN ('SUCCEEDED', 'FAILED')),
+        CONSTRAINT UQ_AutomationActionHistories_Action_Attempt UNIQUE (QueueActionId, AttemptNumber)
+    );
+
+    CREATE INDEX IX_AutomationActionHistories_Execution
+        ON dbo.AutomationActionHistories (AutomationExecutionId, Id);
+    CREATE INDEX IX_AutomationActionHistories_Retention
+        ON dbo.AutomationActionHistories (CompletedAt, Id);
+END;
+GO
+
+-- Add the QueueTrigger -> Execution relationship after both tables exist.  It is intentionally not
+-- cascading: queue cleanup must never remove durable execution/audit rows.
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.foreign_keys
+    WHERE parent_object_id = OBJECT_ID('dbo.AutomationTriggerQueueTrigger')
+      AND name = 'FK_AutomationTriggerQueueTrigger_AutomationExecution'
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerQueueTrigger WITH CHECK ADD CONSTRAINT
+        FK_AutomationTriggerQueueTrigger_AutomationExecution
+        FOREIGN KEY (AutomationExecutionId) REFERENCES dbo.AutomationExecutions(Id);
+END;
+GO
+
+MERGE dbo.AutomationSettings AS target
+USING
+(
+    VALUES
+        ('ActionLeaseSeconds', '300', 'Lease duration for atomically claimed application actions'),
+        ('ActionMaxAttempts', '5', 'Maximum action delivery attempts before terminal failure'),
+        ('QueueRetentionDays', '7', 'Completed processing queue retention'),
+        ('RuleAuditRetentionDays', '30', 'Detailed evaluation rule audit retention'),
+        ('AuditRetentionDays', '365', 'Evaluation, execution, and action summary retention')
+) AS source(SettingKey, SettingValue, Description)
+ON target.SettingKey = source.SettingKey
+WHEN NOT MATCHED THEN
+    INSERT (SettingKey, SettingValue, Description)
+    VALUES (source.SettingKey, source.SettingValue, source.Description);
+GO
+
+-- Durable rows retain the originating queue id as a correlation value, not as a lifecycle foreign
+-- key.  Removing these two FKs allows bounded queue cleanup without deleting audit/executions.
+DECLARE @DropQueueForeignKeySql NVARCHAR(MAX) = NULL;
+SELECT TOP (1)
+    @DropQueueForeignKeySql = N'ALTER TABLE dbo.AutomationExecutions DROP CONSTRAINT '
+        + QUOTENAME(foreign_key.name) + N';'
+FROM sys.foreign_keys AS foreign_key
+INNER JOIN sys.foreign_key_columns AS foreign_key_column
+    ON foreign_key_column.constraint_object_id = foreign_key.object_id
+WHERE foreign_key.parent_object_id = OBJECT_ID('dbo.AutomationExecutions')
+  AND foreign_key.referenced_object_id = OBJECT_ID('dbo.AutomationTriggerQueueSummary')
+  AND COL_NAME(foreign_key.parent_object_id, foreign_key_column.parent_column_id) = 'QueueSummaryId';
+IF @DropQueueForeignKeySql IS NOT NULL EXEC sys.sp_executesql @DropQueueForeignKeySql;
+GO
+
+DECLARE @DropAuditQueueForeignKeySql NVARCHAR(MAX) = NULL;
+SELECT TOP (1)
+    @DropAuditQueueForeignKeySql = N'ALTER TABLE dbo.AutomationEvaluations DROP CONSTRAINT '
+        + QUOTENAME(foreign_key.name) + N';'
+FROM sys.foreign_keys AS foreign_key
+INNER JOIN sys.foreign_key_columns AS foreign_key_column
+    ON foreign_key_column.constraint_object_id = foreign_key.object_id
+WHERE foreign_key.parent_object_id = OBJECT_ID('dbo.AutomationEvaluations')
+  AND foreign_key.referenced_object_id = OBJECT_ID('dbo.AutomationTriggerQueueSummary')
+  AND COL_NAME(foreign_key.parent_object_id, foreign_key_column.parent_column_id) = 'QueueSummaryId';
+IF @DropAuditQueueForeignKeySql IS NOT NULL EXEC sys.sp_executesql @DropAuditQueueForeignKeySql;
+GO
+
+DECLARE @DropHistoryActionForeignKeySql NVARCHAR(MAX) = NULL;
+SELECT TOP (1)
+    @DropHistoryActionForeignKeySql = N'ALTER TABLE dbo.AutomationActionHistories DROP CONSTRAINT '
+        + QUOTENAME(foreign_key.name) + N';'
+FROM sys.foreign_keys AS foreign_key
+INNER JOIN sys.foreign_key_columns AS foreign_key_column
+    ON foreign_key_column.constraint_object_id = foreign_key.object_id
+WHERE foreign_key.parent_object_id = OBJECT_ID('dbo.AutomationActionHistories')
+  AND foreign_key.referenced_object_id = OBJECT_ID('dbo.AutomationTriggerQueueAction')
+  AND COL_NAME(foreign_key.parent_object_id, foreign_key_column.parent_column_id) = 'QueueActionId';
+IF @DropHistoryActionForeignKeySql IS NOT NULL EXEC sys.sp_executesql @DropHistoryActionForeignKeySql;
 GO

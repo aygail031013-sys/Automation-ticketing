@@ -109,10 +109,11 @@ BEGIN
     INSERT INTO dbo.AutomationTriggerRules (TriggerBlockId, RuleOrder, FieldSource, FieldCode, Operator, Value)
     VALUES (@Block1Id, 1, 'DEFAULT', 'subject', 'CONTAINS', 'URGENT');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
     VALUES 
-        (@Trigger1Id, 1, 'SET_PRIORITY', '{"priority": "URGENT"}'),
-        (@Trigger1Id, 2, 'SEND_EMAIL', '{"to": "oncall@example.com", "template": "urgent_alert", "subject": "Urgent Ticket {{ticket.ticketNo}} Alert"}');
+        (@Trigger1Id, 1, 'SET_PRIORITY', '{"priority": "URGENT"}', 'AUTOMATION', 'priority'),
+        (@Trigger1Id, 2, 'SEND_EMAIL', '{"to": "oncall@example.com", "template": "urgent_alert", "subject": "Urgent Ticket {{ticket.ticketNo}} Alert"}', 'APPLICATION', NULL);
 END;
 
 -- 4.2 Trigger 2: Standard Ticket Triage (TICKET_CREATED, Priority 50 - Lower Priority)
@@ -132,8 +133,9 @@ BEGIN
     INSERT INTO dbo.AutomationTriggerRules (TriggerBlockId, RuleOrder, FieldSource, FieldCode, Operator, Value)
     VALUES (@Block2Id, 1, 'DEFAULT', 'status', 'EQUALS', 'OPEN');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
-    VALUES (@Trigger2Id, 1, 'SET_STATUS', '{"status": "IN_PROGRESS"}');
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
+    VALUES (@Trigger2Id, 1, 'SET_STATUS', '{"status": "PENDING"}', 'AUTOMATION', 'status');
 END;
 
 -- 4.3 Trigger 3: Reopen Ticket on Customer Public Reply (PUBLIC_REPLY_ADDED, Priority 10)
@@ -155,10 +157,11 @@ BEGIN
         (@Block3Id, 1, 'EVENT', 'actorType', 'EQUALS', 'CUSTOMER'),
         (@Block3Id, 2, 'DEFAULT', 'status', 'EQUALS', 'PENDING');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
     VALUES 
-        (@Trigger3Id, 1, 'SET_STATUS', '{"status": "OPEN"}'),
-        (@Trigger3Id, 2, 'ADD_NOTE', '{"body": "Reopened automatically following customer reply."}');
+        (@Trigger3Id, 1, 'SET_STATUS', '{"status": "OPEN"}', 'AUTOMATION', 'status'),
+        (@Trigger3Id, 2, 'ADD_NOTE', '{"body": "Reopened automatically following customer reply."}', 'APPLICATION', NULL);
 END;
 
 -- 4.4 Trigger 4: Auto-Close Inactive Pending Tickets (TIME_TRIGGER, Priority 10)
@@ -180,10 +183,11 @@ BEGIN
         (@Block4Id, 1, 'DEFAULT', 'status', 'EQUALS', 'PENDING'),
         (@Block4Id, 2, 'DEFAULT', 'hoursSinceStatusChanged', 'GREATER_THAN', '24');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
     VALUES 
-        (@Trigger4Id, 1, 'SET_STATUS', '{"status": "CLOSED"}'),
-        (@Trigger4Id, 2, 'SEND_EMAIL', '{"to": "{{ticket.requesterEmail}}", "template": "ticket_closed_notice"}');
+        (@Trigger4Id, 1, 'SET_STATUS', '{"status": "CLOSED"}', 'AUTOMATION', 'status'),
+        (@Trigger4Id, 2, 'SEND_EMAIL', '{"to": "{{ticket.requesterEmail}}", "template": "ticket_closed_notice"}', 'APPLICATION', NULL);
 END;
 
 -- 4.5 Trigger 5 & 6: Cascade Loop Test Triggers (TICKET_UPDATED)
@@ -203,13 +207,16 @@ BEGIN
     INSERT INTO dbo.AutomationTriggerRules (TriggerBlockId, RuleOrder, FieldSource, FieldCode, Operator, Value)
     VALUES (@Block5Id, 1, 'DEFAULT', 'status', 'CHANGED_TO', 'WAITING_FOR_COACH');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
-    VALUES (@Trigger5Id, 1, 'SET_STATUS', '{"status": "WAITING_FOR_WLB"}');
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
+    VALUES (@Trigger5Id, 1, 'SET_STATUS', '{"status": "WAITING_FOR_WLB"}', 'AUTOMATION', 'status');
 END
 ELSE
 BEGIN
     UPDATE dbo.AutomationTriggerRules SET Value = 'WAITING_FOR_COACH' WHERE TriggerBlockId IN (SELECT Id FROM dbo.AutomationTriggerBlocks WHERE TriggerId = @Trigger5Id);
-    UPDATE dbo.AutomationTriggerActions SET ActionValue = '{"status": "WAITING_FOR_WLB"}' WHERE TriggerId = @Trigger5Id;
+    UPDATE dbo.AutomationTriggerActions
+    SET ActionValue = '{"status": "WAITING_FOR_WLB"}', ExecutionTarget = 'AUTOMATION', TargetField = 'status'
+    WHERE TriggerId = @Trigger5Id;
 END;
 
 DECLARE @Trigger6Id UNIQUEIDENTIFIER;
@@ -228,14 +235,36 @@ BEGIN
     INSERT INTO dbo.AutomationTriggerRules (TriggerBlockId, RuleOrder, FieldSource, FieldCode, Operator, Value)
     VALUES (@Block6Id, 1, 'DEFAULT', 'status', 'CHANGED_TO', 'WAITING_FOR_WLB');
 
-    INSERT INTO dbo.AutomationTriggerActions (TriggerId, ActionOrder, ActionType, ActionValue)
-    VALUES (@Trigger6Id, 1, 'SET_STATUS', '{"status": "WAITING_FOR_COACH"}');
+    INSERT INTO dbo.AutomationTriggerActions
+        (TriggerId, ActionOrder, ActionType, ActionValue, ExecutionTarget, TargetField)
+    VALUES (@Trigger6Id, 1, 'SET_STATUS', '{"status": "WAITING_FOR_COACH"}', 'AUTOMATION', 'status');
 END
 ELSE
 BEGIN
     UPDATE dbo.AutomationTriggerRules SET Value = 'WAITING_FOR_WLB' WHERE TriggerBlockId IN (SELECT Id FROM dbo.AutomationTriggerBlocks WHERE TriggerId = @Trigger6Id);
-    UPDATE dbo.AutomationTriggerActions SET ActionValue = '{"status": "WAITING_FOR_COACH"}' WHERE TriggerId = @Trigger6Id;
+    UPDATE dbo.AutomationTriggerActions
+    SET ActionValue = '{"status": "WAITING_FOR_COACH"}', ExecutionTarget = 'AUTOMATION', TargetField = 'status'
+    WHERE TriggerId = @Trigger6Id;
 END;
+
+-- Normalize rows from installations that previously ran the v1 draft seed before ExecutionTarget
+-- and TargetField existed. This changes configuration only; dispatched ActionValue snapshots remain
+-- immutable.
+UPDATE dbo.AutomationTriggerActions
+SET ExecutionTarget = CASE
+        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'SET_AGENT',
+                            'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD') THEN 'AUTOMATION'
+        ELSE 'APPLICATION'
+    END,
+    TargetField = CASE ActionType
+        WHEN 'SET_STATUS' THEN 'status'
+        WHEN 'SET_PRIORITY' THEN 'priority'
+        WHEN 'SET_GROUP' THEN 'groupId'
+        WHEN 'SET_AGENT' THEN 'assignedAgentId'
+        WHEN 'SET_TYPE' THEN 'typeOptionId'
+        WHEN 'SET_DUE_DATE' THEN 'dueDate'
+        ELSE TargetField
+    END;
 GO
 
 PRINT 'Seed data inserted successfully.';

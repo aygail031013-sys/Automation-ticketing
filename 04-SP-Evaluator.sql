@@ -1,499 +1,418 @@
 -- =================================================================================================
--- OneDesk Automation v1.0 - Phase 3: Evaluator Engine SP
+-- OneDesk Automation - set-based rule evaluation, deterministic selection, and action dispatch
 -- =================================================================================================
 USE OneDeskDb;
 GO
-
 SET ANSI_NULLS ON;
 GO
 SET QUOTED_IDENTIFIER ON;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.ganymede_automationEvaluateBatch
-    @BatchSize INT = 50,
+    @BatchSize INT = 100,
     @EvaluatedCount INT = 0 OUTPUT,
-    @ExecutionsCreatedCount INT = 0 OUTPUT
+    @ExecutionsCreatedCount INT = 0 OUTPUT,
+    @WorkerId VARCHAR(100) = 'DB-Evaluator'
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
+    SET @BatchSize = CASE WHEN @BatchSize BETWEEN 1 AND 1000 THEN @BatchSize ELSE 100 END;
     SET @EvaluatedCount = 0;
     SET @ExecutionsCreatedCount = 0;
 
-    -- 1. Read MaxExecutionDepth configuration
-    DECLARE @MaxExecutionDepth INT = 10;
-    SELECT @MaxExecutionDepth = TRY_CAST(SettingValue AS INT)
-    FROM dbo.AutomationSettings WITH (NOLOCK)
-    WHERE SettingKey = 'MaxExecutionDepth';
-
-    IF @MaxExecutionDepth IS NULL
-        SET @MaxExecutionDepth = 10;
-
-    -- 2. Select batch of pending queue items
-    DECLARE @PendingQueue TABLE
+    DECLARE @Now DATETIMEOFFSET = SYSUTCDATETIME() AT TIME ZONE 'UTC';
+    DECLARE @MaxDepth INT = COALESCE
     (
-        RowId INT NOT NULL PRIMARY KEY,
-        Id BIGINT NOT NULL,
+        (SELECT TRY_CONVERT(INT, SettingValue) FROM dbo.AutomationSettings WHERE SettingKey = 'MaxExecutionDepth'),
+        10
+    );
+
+    CREATE TABLE #Claimed
+    (
+        QueueSummaryId BIGINT NOT NULL PRIMARY KEY,
         TicketId UNIQUEIDENTIFIER NOT NULL,
-        QueueSourceType VARCHAR(30) NOT NULL,
+        EventType VARCHAR(50) NOT NULL,
         CandidateTriggerId UNIQUEIDENTIFIER NULL,
         SourceAutomationExecutionId UNIQUEIDENTIFIER NULL,
         RootExecutionId UNIQUEIDENTIFIER NULL,
-        ExecutionDepth INT NOT NULL,
-        OccurredAt DATETIMEOFFSET NOT NULL,
-        IsBusinessHour BIT NOT NULL,
-        IsHoliday BIT NOT NULL
+        ExecutionDepth INT NOT NULL
     );
 
-    INSERT INTO @PendingQueue
+    CREATE TABLE #Evaluations
     (
-        RowId,
-        Id,
-        TicketId,
-        QueueSourceType,
-        CandidateTriggerId,
-        SourceAutomationExecutionId,
-        RootExecutionId,
-        ExecutionDepth,
-        OccurredAt,
-        IsBusinessHour,
-        IsHoliday
-    )
-    SELECT TOP (@BatchSize)
-        ROW_NUMBER() OVER (ORDER BY qs.Id ASC),
-        qs.Id,
-        qs.TicketId,
-        qs.QueueSourceType,
-        qs.CandidateTriggerId,
-        qs.SourceAutomationExecutionId,
-        qs.RootExecutionId,
-        qs.ExecutionDepth,
-        qs.OccurredAt,
-        qs.IsBusinessHour,
-        qs.IsHoliday
-    FROM dbo.AutomationTriggerQueueSummary qs WITH (NOLOCK)
-    WHERE qs.Status = 'PENDING'
-    ORDER BY qs.Id ASC;
-
-    DECLARE @TotalQueueRows INT = (SELECT COUNT(*) FROM @PendingQueue);
-    DECLARE @CurrentQueueRow INT = 1;
-
-    -- Working tables declared once outside the loop without IDENTITY
-    DECLARE @CandidateTriggers TABLE
-    (
-        TriggerRowId INT NOT NULL PRIMARY KEY,
+        EvaluationId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+        QueueSummaryId BIGINT NOT NULL,
+        TicketId UNIQUEIDENTIFIER NOT NULL,
+        EventType VARCHAR(50) NOT NULL,
         TriggerId UNIQUEIDENTIFIER NOT NULL,
-        Priority INT NOT NULL
+        ExecutionMode VARCHAR(20) NOT NULL,
+        SortOrder INT NOT NULL,
+        IsMatch BIT NOT NULL DEFAULT (0),
+        IsSelected BIT NOT NULL DEFAULT (0),
+        UNIQUE (QueueSummaryId, TriggerId)
     );
 
-    DECLARE @TriggerBlocks TABLE
+    CREATE TABLE #RuleResults
     (
-        BlockRowId INT NOT NULL PRIMARY KEY,
-        BlockId UNIQUEIDENTIFIER NOT NULL,
-        LogicalOperator VARCHAR(10) NOT NULL
-    );
-
-    DECLARE @BlockRules TABLE
-    (
-        RuleRowId INT NOT NULL PRIMARY KEY,
+        EvaluationId UNIQUEIDENTIFIER NOT NULL,
+        QueueSummaryId BIGINT NOT NULL,
+        TriggerId UNIQUEIDENTIFIER NOT NULL,
+        TriggerBlockId UNIQUEIDENTIFIER NOT NULL,
         RuleId UNIQUEIDENTIFIER NOT NULL,
         FieldSource VARCHAR(20) NOT NULL,
         FieldCode VARCHAR(100) NOT NULL,
         Operator VARCHAR(50) NOT NULL,
-        Value NVARCHAR(MAX) NULL
+        FromValue NVARCHAR(MAX) NULL,
+        ToValue NVARCHAR(MAX) NULL,
+        ExpectedValue NVARCHAR(MAX) NULL,
+        IsMatch BIT NOT NULL,
+        PRIMARY KEY (EvaluationId, RuleId)
     );
 
-    WHILE @CurrentQueueRow <= @TotalQueueRows
-    BEGIN
-        DECLARE @QueueId BIGINT;
-        DECLARE @TicketId UNIQUEIDENTIFIER;
-        DECLARE @QueueSourceType VARCHAR(30);
-        DECLARE @CandidateTriggerId UNIQUEIDENTIFIER;
-        DECLARE @SourceAutomationExecutionId UNIQUEIDENTIFIER;
-        DECLARE @RootExecutionId UNIQUEIDENTIFIER;
-        DECLARE @ExecutionDepth INT;
-        DECLARE @OccurredAt DATETIMEOFFSET;
-        DECLARE @IsBusinessHour BIT;
-        DECLARE @IsHoliday BIT;
+    CREATE TABLE #BlockResults
+    (
+        EvaluationId UNIQUEIDENTIFIER NOT NULL,
+        TriggerBlockId UNIQUEIDENTIFIER NOT NULL,
+        LogicalOperator VARCHAR(10) NOT NULL,
+        IsMatch BIT NOT NULL,
+        PRIMARY KEY (EvaluationId, TriggerBlockId)
+    );
 
+    CREATE TABLE #Selected
+    (
+        EvaluationId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+        ExecutionId UNIQUEIDENTIFIER NOT NULL UNIQUE,
+        QueueSummaryId BIGINT NOT NULL,
+        TicketId UNIQUEIDENTIFIER NOT NULL,
+        TriggerId UNIQUEIDENTIFIER NOT NULL,
+        SortOrder INT NOT NULL
+    );
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        ;WITH Claimable AS
+        (
+            SELECT TOP (@BatchSize) summary.*
+            FROM dbo.AutomationTriggerQueueSummary AS summary WITH (UPDLOCK, READPAST, ROWLOCK)
+            WHERE summary.Status = 'PENDING'
+               OR (summary.Status = 'PROCESSING' AND summary.LeaseExpiresAt < @Now)
+            ORDER BY summary.OccurredAt, summary.Id
+        )
+        UPDATE Claimable
+        SET Status = 'PROCESSING',
+            ClaimedBy = @WorkerId,
+            ClaimedAt = @Now,
+            LeaseExpiresAt = DATEADD(MINUTE, 5, @Now),
+            ErrorMessage = NULL
+        OUTPUT
+            inserted.Id, inserted.TicketId, inserted.EventType, inserted.CandidateTriggerId,
+            inserted.SourceAutomationExecutionId, inserted.RootExecutionId, inserted.ExecutionDepth
+        INTO #Claimed
+        (
+            QueueSummaryId, TicketId, EventType, CandidateTriggerId,
+            SourceAutomationExecutionId, RootExecutionId, ExecutionDepth
+        );
+
+        SELECT @EvaluatedCount = COUNT(*) FROM #Claimed;
+
+        UPDATE summary
+        SET Status = 'SKIPPED',
+            SkipReason = 'SKIPPED_MAX_DEPTH',
+            ProcessedAt = @Now,
+            LeaseExpiresAt = NULL
+        FROM dbo.AutomationTriggerQueueSummary AS summary
+        INNER JOIN #Claimed AS claimed ON claimed.QueueSummaryId = summary.Id
+        WHERE claimed.ExecutionDepth > @MaxDepth;
+
+        DELETE FROM #Claimed WHERE ExecutionDepth > @MaxDepth;
+
+        INSERT #Evaluations
+        (
+            EvaluationId, QueueSummaryId, TicketId, EventType, TriggerId,
+            ExecutionMode, SortOrder, IsMatch, IsSelected
+        )
         SELECT
-            @QueueId = Id,
-            @TicketId = TicketId,
-            @QueueSourceType = QueueSourceType,
-            @CandidateTriggerId = CandidateTriggerId,
-            @SourceAutomationExecutionId = SourceAutomationExecutionId,
-            @RootExecutionId = RootExecutionId,
-            @ExecutionDepth = ExecutionDepth,
-            @OccurredAt = OccurredAt,
-            @IsBusinessHour = IsBusinessHour,
-            @IsHoliday = IsHoliday
-        FROM @PendingQueue
-        WHERE RowId = @CurrentQueueRow;
+            NEWID(), claimed.QueueSummaryId, claimed.TicketId, claimed.EventType, trigger_definition.Id,
+            COALESCE(setting.ExecutionMode, 'FIRST_MATCH'), trigger_definition.Priority, 0, 0
+        FROM #Claimed AS claimed
+        INNER JOIN dbo.AutomationTriggers AS trigger_definition
+            ON trigger_definition.IsActive = 1
+           AND
+           (
+               (claimed.CandidateTriggerId IS NOT NULL AND trigger_definition.Id = claimed.CandidateTriggerId)
+               OR
+               (claimed.CandidateTriggerId IS NULL AND trigger_definition.EventType = claimed.EventType)
+           )
+        LEFT JOIN dbo.AutomationEventSettings AS setting
+            ON setting.EventType = claimed.EventType AND setting.IsActive = 1;
 
-        -- 3. Cascade Protection: If ExecutionDepth > MaxExecutionDepth, skip execution creation
-        IF @ExecutionDepth > @MaxExecutionDepth
-        BEGIN
-            UPDATE dbo.AutomationTriggerQueueSummary
-            SET Status = 'SKIPPED',
-                SkipReason = 'SKIPPED_MAX_DEPTH',
-                ProcessedAt = (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-            WHERE Id = @QueueId;
+        INSERT dbo.AutomationEvaluations
+        (
+            Id, QueueSummaryId, TicketId, TriggerId, EventType, ExecutionMode,
+            SortOrder, IsMatch, IsSelected, EvaluatedAt
+        )
+        SELECT
+            EvaluationId, QueueSummaryId, TicketId, TriggerId, EventType, ExecutionMode,
+            SortOrder, 0, 0, @Now
+        FROM #Evaluations;
 
-            SET @EvaluatedCount = @EvaluatedCount + 1;
-            SET @CurrentQueueRow = @CurrentQueueRow + 1;
-            CONTINUE;
-        END;
-
-        -- 4. Determine EventType & ExecutionMode
-        DECLARE @EventType VARCHAR(50) = NULL;
-
-        IF @QueueSourceType = 'TIME_TRIGGER'
-        BEGIN
-            SET @EventType = 'TIME_TRIGGER';
-        END
-        ELSE
-        BEGIN
-            SELECT TOP 1 @EventType = NewValue
-            FROM dbo.AutomationTriggerQueueDelta WITH (NOLOCK)
-            WHERE QueueSummaryId = @QueueId
-              AND FieldSource = 'EVENT'
-              AND FieldCode = 'event';
-
-            IF @EventType IS NULL
-                SET @EventType = 'UNKNOWN';
-        END;
-
-        DECLARE @ExecutionMode VARCHAR(20) = 'FIRST_MATCH';
-        SELECT TOP 1 @ExecutionMode = ExecutionMode
-        FROM dbo.AutomationEventSettings WITH (NOLOCK)
-        WHERE EventType = @EventType AND IsActive = 1;
-
-        IF @ExecutionMode IS NULL
-            SET @ExecutionMode = 'FIRST_MATCH';
-
-        -- 5. Candidate Triggers
-        DELETE FROM @CandidateTriggers;
-
-        IF @CandidateTriggerId IS NOT NULL
-        BEGIN
-            INSERT INTO @CandidateTriggers (TriggerRowId, TriggerId, Priority)
-            SELECT 1, t.Id, t.Priority
-            FROM dbo.AutomationTriggers t WITH (NOLOCK)
-            WHERE t.Id = @CandidateTriggerId AND t.IsActive = 1;
-        END
-        ELSE
-        BEGIN
-            INSERT INTO @CandidateTriggers (TriggerRowId, TriggerId, Priority)
-            SELECT 
-                ROW_NUMBER() OVER (ORDER BY t.Priority ASC, t.CreatedAt ASC),
-                t.Id, 
-                t.Priority
-            FROM dbo.AutomationTriggers t WITH (NOLOCK)
-            WHERE t.EventType = @EventType AND t.IsActive = 1;
-        END;
-
-        DECLARE @TotalTriggers INT = (SELECT COUNT(*) FROM @CandidateTriggers);
-        DECLARE @CurrentTriggerRow INT = 1;
-        DECLARE @AnyTriggerMatched BIT = 0;
-
-        WHILE @CurrentTriggerRow <= @TotalTriggers
-        BEGIN
-            DECLARE @TriggerId UNIQUEIDENTIFIER;
-            SELECT @TriggerId = TriggerId
-            FROM @CandidateTriggers
-            WHERE TriggerRowId = @CurrentTriggerRow;
-
-            -- Evaluate Blocks for this trigger
-            DELETE FROM @TriggerBlocks;
-
-            INSERT INTO @TriggerBlocks (BlockRowId, BlockId, LogicalOperator)
-            SELECT 
-                ROW_NUMBER() OVER (ORDER BY b.BlockOrder ASC),
-                b.Id, 
-                b.LogicalOperator
-            FROM dbo.AutomationTriggerBlocks b WITH (NOLOCK)
-            WHERE b.TriggerId = @TriggerId;
-
-            DECLARE @TotalBlocks INT = (SELECT COUNT(*) FROM @TriggerBlocks);
-            DECLARE @TriggerMatched BIT = 1;
-
-            IF @TotalBlocks > 0
-            BEGIN
-                DECLARE @CurrentBlockRow INT = 1;
-                DECLARE @HasOrSuccess BIT = 0;
-                DECLARE @HasAndFailure BIT = 0;
-
-                WHILE @CurrentBlockRow <= @TotalBlocks
-                BEGIN
-                    DECLARE @BlockId UNIQUEIDENTIFIER;
-                    DECLARE @BlockOp VARCHAR(10);
-                    SELECT @BlockId = BlockId, @BlockOp = LogicalOperator
-                    FROM @TriggerBlocks
-                    WHERE BlockRowId = @CurrentBlockRow;
-
-                    -- Evaluate Rules in this block
-                    DELETE FROM @BlockRules;
-
-                    INSERT INTO @BlockRules (RuleRowId, RuleId, FieldSource, FieldCode, Operator, Value)
-                    SELECT 
-                        ROW_NUMBER() OVER (ORDER BY r.RuleOrder ASC),
-                        r.Id, 
-                        r.FieldSource, 
-                        r.FieldCode, 
-                        r.Operator, 
-                        r.Value
-                    FROM dbo.AutomationTriggerRules r WITH (NOLOCK)
-                    WHERE r.TriggerBlockId = @BlockId;
-
-                    DECLARE @TotalRules INT = (SELECT COUNT(*) FROM @BlockRules);
-                    DECLARE @CurrentRuleRow INT = 1;
-                    DECLARE @BlockMatched BIT = 1;
-
-                    WHILE @CurrentRuleRow <= @TotalRules
-                    BEGIN
-                        DECLARE @RuleId UNIQUEIDENTIFIER;
-                        DECLARE @FieldSource VARCHAR(20);
-                        DECLARE @FieldCode VARCHAR(100);
-                        DECLARE @RuleOp VARCHAR(50);
-                        DECLARE @ExpectedVal NVARCHAR(MAX);
-
-                        SELECT
-                            @RuleId = RuleId,
-                            @FieldSource = FieldSource,
-                            @FieldCode = FieldCode,
-                            @RuleOp = UPPER(Operator),
-                            @ExpectedVal = Value
-                        FROM @BlockRules
-                        WHERE RuleRowId = @CurrentRuleRow;
-
-                        -- Fetch Actual Values from Delta
-                        DECLARE @ActualOldVal NVARCHAR(MAX) = NULL;
-                        DECLARE @ActualNewVal NVARCHAR(MAX) = NULL;
-
-                        SELECT TOP 1
-                            @ActualOldVal = OldValue,
-                            @ActualNewVal = NewValue
-                        FROM dbo.AutomationTriggerQueueDelta WITH (NOLOCK)
-                        WHERE QueueSummaryId = @QueueId
-                          AND (
-                                (FieldSource = @FieldSource AND FieldCode = @FieldCode COLLATE DATABASE_DEFAULT)
-                                OR (@FieldSource = 'DEFAULT' AND FieldCode = LOWER(@FieldCode) COLLATE DATABASE_DEFAULT)
-                              );
-
-                        -- Fallback for business hours/holidays if evaluated directly
-                        IF @FieldCode IN ('isBusinessHour', 'is_business_hour')
-                            SET @ActualNewVal = CAST(@IsBusinessHour AS NVARCHAR(MAX));
-                        IF @FieldCode IN ('isHoliday', 'is_holiday')
-                            SET @ActualNewVal = CAST(@IsHoliday AS NVARCHAR(MAX));
-
-                        -- Evaluate rule operator
-                        DECLARE @RuleMatched BIT = 0;
-
-                        IF @RuleOp IN ('EQUALS', '=')
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) = UPPER(ISNULL(@ExpectedVal, ''))
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp IN ('NOT_EQUALS', '!=', '<>')
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) <> UPPER(ISNULL(@ExpectedVal, ''))
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'CONTAINS'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) LIKE '%' + UPPER(ISNULL(@ExpectedVal, '')) + '%'
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'NOT_CONTAINS'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) NOT LIKE '%' + UPPER(ISNULL(@ExpectedVal, '')) + '%'
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'STARTS_WITH'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) LIKE UPPER(ISNULL(@ExpectedVal, '')) + '%'
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'ENDS_WITH'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) LIKE '%' + UPPER(ISNULL(@ExpectedVal, ''))
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'CHANGED_TO'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualNewVal, '')) = UPPER(ISNULL(@ExpectedVal, ''))
-                               AND (ISNULL(@ActualOldVal, '') <> ISNULL(@ActualNewVal, '') OR @ActualOldVal IS NULL)
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'CHANGED_FROM'
-                        BEGIN
-                            IF UPPER(ISNULL(@ActualOldVal, '')) = UPPER(ISNULL(@ExpectedVal, ''))
-                               AND (ISNULL(@ActualOldVal, '') <> ISNULL(@ActualNewVal, '') OR @ActualNewVal IS NULL)
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'CHANGED'
-                        BEGIN
-                            IF ISNULL(@ActualOldVal, '') <> ISNULL(@ActualNewVal, '')
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'IS_EMPTY'
-                        BEGIN
-                            IF @ActualNewVal IS NULL OR LTRIM(RTRIM(@ActualNewVal)) = ''
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'IS_NOT_EMPTY'
-                        BEGIN
-                            IF @ActualNewVal IS NOT NULL AND LTRIM(RTRIM(@ActualNewVal)) <> ''
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp IN ('GREATER_THAN', '>')
-                        BEGIN
-                            IF TRY_CAST(@ActualNewVal AS DECIMAL(18,4)) > TRY_CAST(@ExpectedVal AS DECIMAL(18,4))
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp IN ('LESS_THAN', '<')
-                        BEGIN
-                            IF TRY_CAST(@ActualNewVal AS DECIMAL(18,4)) < TRY_CAST(@ExpectedVal AS DECIMAL(18,4))
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'IS_BUSINESS_HOUR'
-                        BEGIN
-                            IF ISNULL(@ActualNewVal, '0') = ISNULL(@ExpectedVal, '1')
-                                SET @RuleMatched = 1;
-                        END
-                        ELSE IF @RuleOp = 'IS_HOLIDAY'
-                        BEGIN
-                            IF ISNULL(@ActualNewVal, '0') = ISNULL(@ExpectedVal, '1')
-                                SET @RuleMatched = 1;
-                        END;
-
-                        -- Record rule audit in AutomationTriggerQueueRule
-                        INSERT INTO dbo.AutomationTriggerQueueRule
+        INSERT #RuleResults
+        (
+            EvaluationId, QueueSummaryId, TriggerId, TriggerBlockId, RuleId,
+            FieldSource, FieldCode, Operator, FromValue, ToValue, ExpectedValue, IsMatch
+        )
+        SELECT
+            evaluation.EvaluationId,
+            evaluation.QueueSummaryId,
+            evaluation.TriggerId,
+            block.Id,
+            rule_definition.Id,
+            rule_definition.FieldSource,
+            rule_definition.FieldCode,
+            UPPER(rule_definition.Operator),
+            actual.OldValue,
+            actual.NewValue,
+            rule_definition.Value,
+            CONVERT(BIT,
+                CASE
+                    WHEN UPPER(rule_definition.Operator) IN ('EQUALS', '=')
+                        AND UPPER(COALESCE(actual.NewValue, '')) = UPPER(COALESCE(rule_definition.Value, '')) THEN 1
+                    WHEN UPPER(rule_definition.Operator) IN ('NOT_EQUALS', '!=', '<>')
+                        AND UPPER(COALESCE(actual.NewValue, '')) <> UPPER(COALESCE(rule_definition.Value, '')) THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'CONTAINS'
+                        AND CHARINDEX(UPPER(COALESCE(rule_definition.Value, '')), UPPER(COALESCE(actual.NewValue, ''))) > 0 THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'NOT_CONTAINS'
+                        AND CHARINDEX(UPPER(COALESCE(rule_definition.Value, '')), UPPER(COALESCE(actual.NewValue, ''))) = 0 THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'STARTS_WITH'
+                        AND LEFT(UPPER(COALESCE(actual.NewValue, '')), LEN(COALESCE(rule_definition.Value, '')))
+                            = UPPER(COALESCE(rule_definition.Value, '')) THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'ENDS_WITH'
+                        AND RIGHT(UPPER(COALESCE(actual.NewValue, '')), LEN(COALESCE(rule_definition.Value, '')))
+                            = UPPER(COALESCE(rule_definition.Value, '')) THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'IN'
+                        AND EXISTS
                         (
-                            QueueSummaryId,
-                            TriggerId,
-                            RuleId,
-                            IsMatched,
-                            EvaluatedAt
-                        )
-                        VALUES
-                        (
-                            @QueueId,
-                            @TriggerId,
-                            @RuleId,
-                            @RuleMatched,
-                            (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-                        );
+                            SELECT 1 FROM STRING_SPLIT(COALESCE(rule_definition.Value, ''), ',') AS item
+                            WHERE UPPER(LTRIM(RTRIM(item.value))) = UPPER(COALESCE(actual.NewValue, ''))
+                        ) THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'CHANGED'
+                        AND COALESCE(actual.OldValue, '') <> COALESCE(actual.NewValue, '') THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'CHANGED_FROM'
+                        AND UPPER(COALESCE(actual.OldValue, '')) = UPPER(COALESCE(rule_definition.Value, ''))
+                        AND COALESCE(actual.OldValue, '') <> COALESCE(actual.NewValue, '') THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'CHANGED_TO'
+                        AND UPPER(COALESCE(actual.NewValue, '')) = UPPER(COALESCE(rule_definition.Value, ''))
+                        AND COALESCE(actual.OldValue, '') <> COALESCE(actual.NewValue, '') THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'IS_EMPTY'
+                        AND NULLIF(LTRIM(RTRIM(actual.NewValue)), '') IS NULL THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'IS_NOT_EMPTY'
+                        AND NULLIF(LTRIM(RTRIM(actual.NewValue)), '') IS NOT NULL THEN 1
+                    WHEN UPPER(rule_definition.Operator) IN ('GT', 'GREATER_THAN', '>')
+                        AND TRY_CONVERT(DECIMAL(38, 10), actual.NewValue) > TRY_CONVERT(DECIMAL(38, 10), rule_definition.Value) THEN 1
+                    WHEN UPPER(rule_definition.Operator) IN ('GTE', 'GREATER_THAN_OR_EQUAL', '>=')
+                        AND TRY_CONVERT(DECIMAL(38, 10), actual.NewValue) >= TRY_CONVERT(DECIMAL(38, 10), rule_definition.Value) THEN 1
+                    WHEN UPPER(rule_definition.Operator) IN ('LT', 'LESS_THAN', '<')
+                        AND TRY_CONVERT(DECIMAL(38, 10), actual.NewValue) < TRY_CONVERT(DECIMAL(38, 10), rule_definition.Value) THEN 1
+                    WHEN UPPER(rule_definition.Operator) IN ('LTE', 'LESS_THAN_OR_EQUAL', '<=')
+                        AND TRY_CONVERT(DECIMAL(38, 10), actual.NewValue) <= TRY_CONVERT(DECIMAL(38, 10), rule_definition.Value) THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'IS_BUSINESS_HOUR'
+                        AND COALESCE(actual.NewValue, '0') = COALESCE(rule_definition.Value, '1') THEN 1
+                    WHEN UPPER(rule_definition.Operator) = 'IS_HOLIDAY'
+                        AND COALESCE(actual.NewValue, '0') = COALESCE(rule_definition.Value, '1') THEN 1
+                    ELSE 0
+                END)
+        FROM #Evaluations AS evaluation
+        INNER JOIN dbo.AutomationTriggerBlocks AS block ON block.TriggerId = evaluation.TriggerId
+        INNER JOIN dbo.AutomationTriggerRules AS rule_definition ON rule_definition.TriggerBlockId = block.Id
+        OUTER APPLY
+        (
+            SELECT TOP (1) delta.OldValue, delta.NewValue
+            FROM dbo.AutomationTriggerQueueDelta AS delta
+            WHERE delta.QueueSummaryId = evaluation.QueueSummaryId
+              AND UPPER(delta.FieldSource) = UPPER(rule_definition.FieldSource)
+              AND LOWER(delta.FieldCode) = LOWER(rule_definition.FieldCode)
+            ORDER BY CASE WHEN delta.OldValue IS NULL THEN 1 ELSE 0 END, delta.Id DESC
+        ) AS actual;
 
-                        IF @RuleMatched = 0
-                        BEGIN
-                            SET @BlockMatched = 0;
-                        END;
+        INSERT dbo.AutomationTriggerQueueRule
+            (QueueSummaryId, TriggerId, RuleId, IsMatched, EvaluatedAt, ActualFromValue, ActualToValue, ExpectedValue)
+        SELECT QueueSummaryId, TriggerId, RuleId, IsMatch, @Now, FromValue, ToValue, ExpectedValue
+        FROM #RuleResults;
 
-                        SET @CurrentRuleRow = @CurrentRuleRow + 1;
-                    END;
+        INSERT dbo.AutomationEvaluationRules
+        (
+            EvaluationId, TriggerBlockId, RuleId, FieldSource, FieldCode, Operator,
+            FromValue, ToValue, ExpectedValue, IsMatch, EvaluatedAt
+        )
+        SELECT
+            EvaluationId, TriggerBlockId, RuleId, FieldSource, FieldCode, Operator,
+            FromValue, ToValue, ExpectedValue, IsMatch, @Now
+        FROM #RuleResults;
 
-                    -- Combine blocks
-                    IF @BlockOp = 'OR'
-                    BEGIN
-                        IF @BlockMatched = 1
-                            SET @HasOrSuccess = 1;
-                    END
-                    ELSE -- Default 'AND'
-                    BEGIN
-                        IF @BlockMatched = 0
-                            SET @HasAndFailure = 1;
-                    END;
+        -- LogicalOperator combines rules inside a block; matching any block matches the trigger.
+        INSERT #BlockResults (EvaluationId, TriggerBlockId, LogicalOperator, IsMatch)
+        SELECT
+            evaluation.EvaluationId,
+            block.Id,
+            block.LogicalOperator,
+            CONVERT(BIT, CASE
+                WHEN COUNT(result.RuleId) = 0 THEN 1
+                WHEN block.LogicalOperator = 'OR' AND MAX(CONVERT(INT, result.IsMatch)) = 1 THEN 1
+                WHEN block.LogicalOperator = 'AND' AND MIN(CONVERT(INT, result.IsMatch)) = 1 THEN 1
+                ELSE 0
+            END)
+        FROM #Evaluations AS evaluation
+        INNER JOIN dbo.AutomationTriggerBlocks AS block ON block.TriggerId = evaluation.TriggerId
+        LEFT JOIN #RuleResults AS result
+            ON result.EvaluationId = evaluation.EvaluationId AND result.TriggerBlockId = block.Id
+        GROUP BY evaluation.EvaluationId, block.Id, block.LogicalOperator;
 
-                    SET @CurrentBlockRow = @CurrentBlockRow + 1;
-                END;
+        INSERT dbo.AutomationEvaluationBlocks
+            (EvaluationId, TriggerBlockId, LogicalOperator, IsMatch, EvaluatedAt)
+        SELECT EvaluationId, TriggerBlockId, LogicalOperator, IsMatch, @Now
+        FROM #BlockResults;
 
-                -- Overall Trigger decision
-                IF @HasAndFailure = 1
-                    SET @TriggerMatched = 0;
-                ELSE IF @HasOrSuccess = 1
-                    SET @TriggerMatched = 1;
-            END;
+        UPDATE evaluation
+        SET IsMatch = CONVERT(BIT, CASE
+            WHEN NOT EXISTS
+            (
+                SELECT 1 FROM dbo.AutomationTriggerBlocks AS block
+                WHERE block.TriggerId = evaluation.TriggerId
+            ) THEN 1
+            WHEN EXISTS
+            (
+                SELECT 1 FROM #BlockResults AS result
+                WHERE result.EvaluationId = evaluation.EvaluationId AND result.IsMatch = 1
+            ) THEN 1
+            ELSE 0
+        END)
+        FROM #Evaluations AS evaluation;
 
-            -- If matched, create Execution and ExecutionActions
-            IF @TriggerMatched = 1
-            BEGIN
-                SET @AnyTriggerMatched = 1;
+        UPDATE audit
+        SET IsMatch = evaluation.IsMatch
+        FROM dbo.AutomationEvaluations AS audit
+        INNER JOIN #Evaluations AS evaluation ON evaluation.EvaluationId = audit.Id;
 
-                DECLARE @NewExecutionId UNIQUEIDENTIFIER = NEWID();
-                DECLARE @CurrentRootId UNIQUEIDENTIFIER = ISNULL(@RootExecutionId, @NewExecutionId);
-
-                INSERT INTO dbo.AutomationExecutions
+        ;WITH RankedMatches AS
+        (
+            SELECT
+                evaluation.*,
+                ROW_NUMBER() OVER
                 (
-                    Id,
-                    QueueSummaryId,
-                    TriggerId,
-                    TicketId,
-                    ParentExecutionId,
-                    RootExecutionId,
-                    ExecutionDepth,
-                    Status,
-                    CreatedAt
-                )
-                VALUES
-                (
-                    @NewExecutionId,
-                    @QueueId,
-                    @TriggerId,
-                    @TicketId,
-                    @SourceAutomationExecutionId,
-                    @CurrentRootId,
-                    @ExecutionDepth,
-                    'PENDING',
-                    (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-                );
+                    PARTITION BY evaluation.QueueSummaryId
+                    ORDER BY evaluation.SortOrder, evaluation.TriggerId
+                ) AS MatchRank
+            FROM #Evaluations AS evaluation
+            WHERE evaluation.IsMatch = 1
+        )
+        INSERT #Selected
+            (EvaluationId, ExecutionId, QueueSummaryId, TicketId, TriggerId, SortOrder)
+        SELECT EvaluationId, NEWID(), QueueSummaryId, TicketId, TriggerId, SortOrder
+        FROM RankedMatches
+        WHERE ExecutionMode = 'ALL_MATCH' OR MatchRank = 1;
 
-                -- Snapshot actions from trigger definition
-                INSERT INTO dbo.AutomationExecutionActions
-                (
-                    Id,
-                    AutomationExecutionId,
-                    ActionOrder,
-                    ActionType,
-                    ActionValue,
-                    Status,
-                    CreatedAt
-                )
-                SELECT
-                    NEWID(),
-                    @NewExecutionId,
-                    act.ActionOrder,
-                    act.ActionType,
-                    act.ActionValue,
-                    'PENDING',
-                    (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-                FROM dbo.AutomationTriggerActions act WITH (NOLOCK)
-                WHERE act.TriggerId = @TriggerId
-                ORDER BY act.ActionOrder ASC;
+        UPDATE evaluation
+        SET IsSelected = 1
+        FROM #Evaluations AS evaluation
+        INNER JOIN #Selected AS selected ON selected.EvaluationId = evaluation.EvaluationId;
 
-                SET @ExecutionsCreatedCount = @ExecutionsCreatedCount + 1;
+        UPDATE audit
+        SET IsSelected = 1
+        FROM dbo.AutomationEvaluations AS audit
+        INNER JOIN #Selected AS selected ON selected.EvaluationId = audit.Id;
 
-                -- If FIRST_MATCH mode, break the trigger loop
-                IF @ExecutionMode = 'FIRST_MATCH'
-                    BREAK;
-            END;
+        INSERT dbo.AutomationExecutions
+        (
+            Id, QueueSummaryId, TriggerId, TicketId, ParentExecutionId,
+            RootExecutionId, ExecutionDepth, Status, CreatedAt
+        )
+        SELECT
+            selected.ExecutionId,
+            selected.QueueSummaryId,
+            selected.TriggerId,
+            selected.TicketId,
+            claimed.SourceAutomationExecutionId,
+            COALESCE(claimed.RootExecutionId, selected.ExecutionId),
+            claimed.ExecutionDepth,
+            'PENDING',
+            @Now
+        FROM #Selected AS selected
+        INNER JOIN #Claimed AS claimed ON claimed.QueueSummaryId = selected.QueueSummaryId;
 
-            SET @CurrentTriggerRow = @CurrentTriggerRow + 1;
-        END;
+        INSERT dbo.AutomationTriggerQueueTrigger
+        (
+            QueueSummaryId, EvaluationId, TriggerId, AutomationExecutionId,
+            SortOrder, Status, CreatedAt
+        )
+        SELECT
+            QueueSummaryId, EvaluationId, TriggerId, ExecutionId, SortOrder, 'DISPATCHED', @Now
+        FROM #Selected;
 
-        -- 6. Mark Queue Summary Completed
-        UPDATE dbo.AutomationTriggerQueueSummary
+        INSERT dbo.AutomationTriggerQueueAction
+        (
+            Id, AutomationExecutionId, TriggerActionId, TicketId, ActionSequence,
+            ActionType, ExecutionTarget, TargetField, ActionValue, Status, CreatedAt
+        )
+        SELECT
+            NEWID(), selected.ExecutionId, action.Id, selected.TicketId, action.ActionOrder,
+            action.ActionType, action.ExecutionTarget, action.TargetField, action.ActionValue,
+            'READY', @Now
+        FROM #Selected AS selected
+        INNER JOIN dbo.AutomationTriggerActions AS action ON action.TriggerId = selected.TriggerId;
+
+        -- A selected trigger with no actions is terminal immediately.
+        UPDATE execution
+        SET Status = 'COMPLETED', ExecutedAt = @Now
+        FROM dbo.AutomationExecutions AS execution
+        INNER JOIN #Selected AS selected ON selected.ExecutionId = execution.Id
+        WHERE NOT EXISTS
+        (
+            SELECT 1 FROM dbo.AutomationTriggerQueueAction AS action
+            WHERE action.AutomationExecutionId = execution.Id
+        );
+
+        UPDATE summary
         SET Status = 'COMPLETED',
-            SkipReason = CASE WHEN @AnyTriggerMatched = 0 THEN 'NO_MATCH' ELSE NULL END,
-            ProcessedAt = (SYSUTCDATETIME() AT TIME ZONE 'UTC')
-        WHERE Id = @QueueId;
+            SkipReason = CASE
+                WHEN NOT EXISTS
+                (
+                    SELECT 1 FROM #Evaluations AS evaluation
+                    WHERE evaluation.QueueSummaryId = summary.Id AND evaluation.IsMatch = 1
+                ) THEN 'NO_MATCH'
+                ELSE NULL
+            END,
+            ProcessedAt = @Now,
+            LeaseExpiresAt = NULL
+        FROM dbo.AutomationTriggerQueueSummary AS summary
+        INNER JOIN #Claimed AS claimed ON claimed.QueueSummaryId = summary.Id;
 
-        SET @EvaluatedCount = @EvaluatedCount + 1;
-        SET @CurrentQueueRow = @CurrentQueueRow + 1;
-    END;
+        -- No-match and no-action create automations can be made visible now. Action-bearing executions
+        -- are finalized by the DB/application action completion procedures.
+        UPDATE ticket
+        SET CreateAutomationStatus = 'READY'
+        FROM dbo.Tickets AS ticket
+        INNER JOIN #Claimed AS claimed ON claimed.TicketId = ticket.Id
+        WHERE claimed.EventType = 'TICKET_CREATED'
+          AND NOT EXISTS
+          (
+              SELECT 1
+              FROM dbo.AutomationExecutions AS execution
+              WHERE execution.QueueSummaryId = claimed.QueueSummaryId
+                AND execution.Status NOT IN ('COMPLETED', 'PARTIAL_FAILED', 'FAILED', 'SKIPPED')
+          );
 
-    SELECT 
-        @EvaluatedCount AS EvaluatedCount, 
-        @ExecutionsCreatedCount AS ExecutionsCreatedCount;
+        SELECT @ExecutionsCreatedCount = COUNT(*) FROM #Selected;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH;
+
+    SELECT @EvaluatedCount AS EvaluatedCount,
+           @ExecutionsCreatedCount AS ExecutionsCreatedCount;
 END;
 GO
