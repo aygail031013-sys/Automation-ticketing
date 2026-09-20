@@ -101,7 +101,7 @@ BEGIN
                         CAST(@Now AT TIME ZONE COALESCE(timezone_resolution.TimezoneName, 'UTC') AS DATE))
                         + @@DATEFIRST - 2) % 7) + 1) AS LocalDayOfWeek
             ) AS local_context
-            WHERE trigger_definition.EventType = 'TIME_TRIGGER'
+            WHERE trigger_definition.EventType IN ('TIME_TRIGGER', 'SCHEDULE_DUE')
               AND trigger_definition.IsActive = 1
               AND NOT EXISTS
               (
@@ -260,6 +260,75 @@ BEGIN
         FROM #Queued AS queued
         INNER JOIN dbo.TicketFieldValues AS value ON value.TicketId = queued.TicketId
         INNER JOIN dbo.TicketFields AS field ON field.Id = value.TicketFieldId;
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT queued.QueueSummaryId, 'TIME', time_value.FieldCode, NULL, time_value.FieldValue
+        FROM #Queued AS queued
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = queued.TicketId
+        CROSS APPLY
+        (
+            VALUES
+                ('hourssincecreated', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, ticket.CreatedAt, @Now))),
+                ('hourssinceupdated', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, ticket.UpdatedAt, @Now))),
+                ('hourssincestatuschanged', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, COALESCE(ticket.StatusChangedAt, ticket.CreatedAt), @Now)))
+        ) AS time_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT queued.QueueSummaryId, 'REQUESTER', requester_value.FieldCode, NULL, requester_value.FieldValue
+        FROM #Queued AS queued
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = queued.TicketId
+        INNER JOIN dbo.Contacts AS requester ON requester.Id = ticket.RequesterContactId
+        CROSS APPLY
+        (
+            VALUES
+                ('status', CONVERT(NVARCHAR(MAX), requester.Status)),
+                ('primary_company_id', CONVERT(NVARCHAR(MAX), requester.PrimaryCompanyId)),
+                ('primary_email', CONVERT(NVARCHAR(MAX), requester.PrimaryEmail))
+        ) AS requester_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT queued.QueueSummaryId, 'COMPANY', company_value.FieldCode, NULL, company_value.FieldValue
+        FROM #Queued AS queued
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = queued.TicketId
+        INNER JOIN dbo.Companies AS company ON company.Id = ticket.RequesterCompanyId
+        OUTER APPLY
+        (
+            SELECT TOP (1) domain.Domain
+            FROM dbo.CompanyDomains AS domain
+            WHERE domain.CompanyId = company.Id
+            ORDER BY domain.Id
+        ) AS primary_domain
+        CROSS APPLY
+        (
+            VALUES
+                ('id', CONVERT(NVARCHAR(MAX), company.Id)),
+                ('name', CONVERT(NVARCHAR(MAX), company.Name)),
+                ('domain', CONVERT(NVARCHAR(MAX), primary_domain.Domain))
+        ) AS company_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT queued.QueueSummaryId, 'ASSIGNED_AGENT', agent_value.FieldCode, NULL, agent_value.FieldValue
+        FROM #Queued AS queued
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = queued.TicketId
+        INNER JOIN dbo.Agents AS agent ON agent.Id = ticket.AssignedAgentId
+        OUTER APPLY
+        (
+            SELECT TOP (1) membership.GroupId
+            FROM dbo.GroupAgents AS membership
+            WHERE membership.AgentId = agent.Id
+            ORDER BY membership.Id
+        ) AS primary_membership
+        CROSS APPLY
+        (
+            VALUES
+                ('status', CONVERT(NVARCHAR(MAX), agent.Status)),
+                ('ticket_availability', CONVERT(NVARCHAR(MAX), agent.TicketAvailability)),
+                ('group_id', CONVERT(NVARCHAR(MAX), primary_membership.GroupId))
+        ) AS agent_value(FieldCode, FieldValue);
 
         SELECT @QueuedCount = COUNT(*) FROM #Queued;
         COMMIT TRANSACTION;

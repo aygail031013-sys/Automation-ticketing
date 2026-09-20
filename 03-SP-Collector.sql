@@ -256,6 +256,22 @@ BEGIN
             (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
         SELECT
             changed.QueueSummaryId,
+            'EVENT',
+            'changedfieldcode',
+            NULL,
+            CASE changed.FieldCode
+                WHEN 'status' THEN 'DEFAULT_STATUS'
+                WHEN 'priority' THEN 'DEFAULT_PRIORITY'
+                WHEN 'groupid' THEN 'DEFAULT_GROUP'
+                WHEN 'assignedagentid' THEN 'DEFAULT_AGENT'
+                ELSE changed.FieldCode
+            END
+        FROM #ChangedCodes AS changed;
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT
+            changed.QueueSummaryId,
             CASE WHEN field.FieldCategory = 'CUSTOM' THEN 'CUSTOM' ELSE 'DEFAULT' END,
             changed.FieldCode,
             old_value.Value,
@@ -333,6 +349,79 @@ BEGIN
               AND existing.FieldSource = 'CUSTOM'
               AND LOWER(existing.FieldCode) = LOWER(field.FieldCode)
         );
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT map.QueueSummaryId, 'TIME', time_value.FieldCode, NULL, time_value.FieldValue
+        FROM #SummaryMap AS map
+        INNER JOIN dbo.AutomationTriggerQueueSummary AS summary ON summary.Id = map.QueueSummaryId
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = summary.TicketId
+        CROSS APPLY
+        (
+            VALUES
+                ('hourssincecreated', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, ticket.CreatedAt, summary.OccurredAt))),
+                ('hourssinceupdated', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, ticket.UpdatedAt, summary.OccurredAt))),
+                ('hourssincestatuschanged', CONVERT(NVARCHAR(MAX), DATEDIFF(HOUR, COALESCE(ticket.StatusChangedAt, ticket.CreatedAt), summary.OccurredAt)))
+        ) AS time_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT map.QueueSummaryId, 'REQUESTER', requester_value.FieldCode, NULL, requester_value.FieldValue
+        FROM #SummaryMap AS map
+        INNER JOIN dbo.AutomationTriggerQueueSummary AS summary ON summary.Id = map.QueueSummaryId
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = summary.TicketId
+        INNER JOIN dbo.Contacts AS requester ON requester.Id = ticket.RequesterContactId
+        CROSS APPLY
+        (
+            VALUES
+                ('status', CONVERT(NVARCHAR(MAX), requester.Status)),
+                ('primary_company_id', CONVERT(NVARCHAR(MAX), requester.PrimaryCompanyId)),
+                ('primary_email', CONVERT(NVARCHAR(MAX), requester.PrimaryEmail))
+        ) AS requester_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT map.QueueSummaryId, 'COMPANY', company_value.FieldCode, NULL, company_value.FieldValue
+        FROM #SummaryMap AS map
+        INNER JOIN dbo.AutomationTriggerQueueSummary AS summary ON summary.Id = map.QueueSummaryId
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = summary.TicketId
+        INNER JOIN dbo.Companies AS company ON company.Id = ticket.RequesterCompanyId
+        OUTER APPLY
+        (
+            SELECT TOP (1) domain.Domain
+            FROM dbo.CompanyDomains AS domain
+            WHERE domain.CompanyId = company.Id
+            ORDER BY domain.Id
+        ) AS primary_domain
+        CROSS APPLY
+        (
+            VALUES
+                ('id', CONVERT(NVARCHAR(MAX), company.Id)),
+                ('name', CONVERT(NVARCHAR(MAX), company.Name)),
+                ('domain', CONVERT(NVARCHAR(MAX), primary_domain.Domain))
+        ) AS company_value(FieldCode, FieldValue);
+
+        INSERT dbo.AutomationTriggerQueueDelta
+            (QueueSummaryId, FieldSource, FieldCode, OldValue, NewValue)
+        SELECT map.QueueSummaryId, 'ASSIGNED_AGENT', agent_value.FieldCode, NULL, agent_value.FieldValue
+        FROM #SummaryMap AS map
+        INNER JOIN dbo.AutomationTriggerQueueSummary AS summary ON summary.Id = map.QueueSummaryId
+        INNER JOIN dbo.Tickets AS ticket ON ticket.Id = summary.TicketId
+        INNER JOIN dbo.Agents AS agent ON agent.Id = ticket.AssignedAgentId
+        OUTER APPLY
+        (
+            SELECT TOP (1) membership.GroupId
+            FROM dbo.GroupAgents AS membership
+            WHERE membership.AgentId = agent.Id
+            ORDER BY membership.Id
+        ) AS primary_membership
+        CROSS APPLY
+        (
+            VALUES
+                ('status', CONVERT(NVARCHAR(MAX), agent.Status)),
+                ('ticket_availability', CONVERT(NVARCHAR(MAX), agent.TicketAvailability)),
+                ('group_id', CONVERT(NVARCHAR(MAX), primary_membership.GroupId))
+        ) AS agent_value(FieldCode, FieldValue);
 
         SELECT @CollectedCount = COUNT(*) FROM #SummaryMap;
         COMMIT TRANSACTION;

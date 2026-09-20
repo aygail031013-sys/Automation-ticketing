@@ -135,7 +135,7 @@ BEGIN
             ExecutionMode, SortOrder, IsMatch, IsSelected
         )
         SELECT
-            NEWID(), claimed.QueueSummaryId, claimed.TicketId, claimed.EventType, trigger_definition.Id,
+            NEWID(), claimed.QueueSummaryId, claimed.TicketId, trigger_definition.EventType, trigger_definition.Id,
             COALESCE(setting.ExecutionMode, 'FIRST_MATCH'), trigger_definition.Priority, 0, 0
         FROM #Claimed AS claimed
         INNER JOIN dbo.AutomationTriggers AS trigger_definition
@@ -144,10 +144,40 @@ BEGIN
            (
                (claimed.CandidateTriggerId IS NOT NULL AND trigger_definition.Id = claimed.CandidateTriggerId)
                OR
-               (claimed.CandidateTriggerId IS NULL AND trigger_definition.EventType = claimed.EventType)
+               (claimed.CandidateTriggerId IS NULL AND
+                (
+                    trigger_definition.EventType = claimed.EventType
+                    OR
+                    (
+                        claimed.EventType = 'TICKET_UPDATED'
+                        AND
+                        (
+                            (trigger_definition.EventType = 'STATUS_CHANGED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'DEFAULT' AND LOWER(d.FieldCode) = 'status' AND COALESCE(d.OldValue, '') <> COALESCE(d.NewValue, '')))
+                            OR (trigger_definition.EventType = 'PRIORITY_CHANGED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'DEFAULT' AND LOWER(d.FieldCode) = 'priority' AND COALESCE(d.OldValue, '') <> COALESCE(d.NewValue, '')))
+                            OR (trigger_definition.EventType = 'GROUP_CHANGED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'DEFAULT' AND LOWER(d.FieldCode) = 'groupid' AND COALESCE(d.OldValue, '') <> COALESCE(d.NewValue, '')))
+                            OR (trigger_definition.EventType = 'ASSIGNEE_CHANGED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'DEFAULT' AND LOWER(d.FieldCode) = 'assignedagentid' AND COALESCE(d.OldValue, '') <> COALESCE(d.NewValue, '')))
+                        )
+                    )
+                    OR
+                    (
+                        claimed.EventType = 'PUBLIC_REPLY_ADDED'
+                        AND
+                        (
+                            (trigger_definition.EventType = 'REQUESTER_REPLIED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'EVENT' AND LOWER(d.FieldCode) = 'actortype' AND UPPER(d.NewValue) = 'CUSTOMER'))
+                            OR (trigger_definition.EventType = 'AGENT_REPLIED' AND EXISTS
+                                (SELECT 1 FROM dbo.AutomationTriggerQueueDelta d WHERE d.QueueSummaryId = claimed.QueueSummaryId AND d.FieldSource = 'EVENT' AND LOWER(d.FieldCode) = 'actortype' AND UPPER(d.NewValue) = 'AGENT'))
+                        )
+                    )
+                    OR (claimed.EventType = 'TIME_TRIGGER' AND trigger_definition.EventType = 'SCHEDULE_DUE')
+                ))
            )
         LEFT JOIN dbo.AutomationEventSettings AS setting
-            ON setting.EventType = claimed.EventType AND setting.IsActive = 1;
+            ON setting.EventType = trigger_definition.EventType AND setting.IsActive = 1;
 
         INSERT dbo.AutomationEvaluations
         (
@@ -232,8 +262,26 @@ BEGIN
             SELECT TOP (1) delta.OldValue, delta.NewValue
             FROM dbo.AutomationTriggerQueueDelta AS delta
             WHERE delta.QueueSummaryId = evaluation.QueueSummaryId
-              AND UPPER(delta.FieldSource) = UPPER(rule_definition.FieldSource)
-              AND LOWER(delta.FieldCode) = LOWER(rule_definition.FieldCode)
+              AND UPPER(delta.FieldSource) = CASE UPPER(rule_definition.FieldSource)
+                    WHEN 'TICKET' THEN 'DEFAULT'
+                    WHEN 'CUSTOM_FIELD' THEN 'CUSTOM'
+                    WHEN 'EVENT_CONTEXT' THEN 'EVENT'
+                    ELSE UPPER(rule_definition.FieldSource)
+                  END
+              AND LOWER(delta.FieldCode) = LOWER(CASE UPPER(rule_definition.FieldCode)
+                    WHEN 'DEFAULT_STATUS' THEN 'status'
+                    WHEN 'DEFAULT_PRIORITY' THEN 'priority'
+                    WHEN 'DEFAULT_SOURCE' THEN 'source'
+                    WHEN 'DEFAULT_GROUP' THEN 'groupid'
+                    WHEN 'DEFAULT_AGENT' THEN 'assignedagentid'
+                    WHEN 'HOURS_SINCE_CREATED' THEN 'hourssincecreated'
+                    WHEN 'HOURS_SINCE_UPDATED' THEN 'hourssinceupdated'
+                    WHEN 'HOURS_SINCE_STATUS_CHANGED' THEN 'hourssincestatuschanged'
+                    WHEN 'EVENT_TYPE' THEN 'event'
+                    WHEN 'ACTOR_TYPE' THEN 'actortype'
+                    WHEN 'CHANGED_FIELD_CODE' THEN 'changedfieldcode'
+                    ELSE rule_definition.FieldCode
+                  END)
             ORDER BY CASE WHEN delta.OldValue IS NULL THEN 1 ELSE 0 END, delta.Id DESC
         ) AS actual;
 

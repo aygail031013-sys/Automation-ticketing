@@ -230,9 +230,18 @@ BEGIN
         5
     );
     DECLARE @IsSuccess BIT = CASE WHEN UPPER(@Status) IN ('SUCCESS', 'SUCCEEDED', 'COMPLETED') THEN 1 ELSE 0 END;
+    DECLARE @StartedTransaction BIT = 0;
 
     BEGIN TRY
-        BEGIN TRANSACTION;
+        IF @@TRANCOUNT = 0
+        BEGIN
+            SET @StartedTransaction = 1;
+            BEGIN TRANSACTION;
+        END
+        ELSE
+        BEGIN
+            SAVE TRANSACTION AutomationActionComplete;
+        END;
 
         SELECT
             @ExecutionId = action.AutomationExecutionId,
@@ -246,7 +255,7 @@ BEGIN
 
         IF @ExecutionId IS NULL
         BEGIN
-            ROLLBACK TRANSACTION;
+            IF @StartedTransaction = 1 ROLLBACK TRANSACTION;
             SELECT 16 AS ErrorCode, 'ACTION_NOT_FOUND' AS ErrorMessage;
             RETURN;
         END;
@@ -254,7 +263,7 @@ BEGIN
         -- Repeated completion calls are idempotent and do not append a second history row.
         IF @CurrentStatus IN ('SUCCEEDED', 'FAILED')
         BEGIN
-            COMMIT TRANSACTION;
+            IF @StartedTransaction = 1 COMMIT TRANSACTION;
             SELECT 0 AS ErrorCode, 'ALREADY_TERMINAL' AS ErrorMessage;
             RETURN;
         END;
@@ -262,7 +271,7 @@ BEGIN
         IF @CurrentStatus <> 'PROCESSING'
            OR (@WorkerId IS NOT NULL AND @ClaimedBy <> @WorkerId)
         BEGIN
-            ROLLBACK TRANSACTION;
+            IF @StartedTransaction = 1 ROLLBACK TRANSACTION;
             SELECT 16 AS ErrorCode, 'ACTION_NOT_OWNED_BY_WORKER' AS ErrorMessage;
             RETURN;
         END;
@@ -302,10 +311,13 @@ BEGIN
         EXEC dbo.ganymede_automationExecutionRefreshStatus
             @AutomationExecutionId = @ExecutionId;
 
-        COMMIT TRANSACTION;
+        IF @StartedTransaction = 1 COMMIT TRANSACTION;
     END TRY
     BEGIN CATCH
-        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        IF @StartedTransaction = 1 AND XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;
+        ELSE IF @StartedTransaction = 0 AND XACT_STATE() = 1
+            ROLLBACK TRANSACTION AutomationActionComplete;
         THROW;
     END CATCH;
 

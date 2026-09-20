@@ -195,7 +195,14 @@ BEGIN
         Value NVARCHAR(MAX) NULL,
         SecondaryValue NVARCHAR(MAX) NULL,
         CreatedAt DATETIMEOFFSET NOT NULL DEFAULT (SYSUTCDATETIME() AT TIME ZONE 'UTC'),
-        CONSTRAINT CK_AutomationTriggerRules_Source CHECK (FieldSource IN ('DEFAULT', 'CUSTOM', 'EVENT', 'SYSTEM'))
+        CONSTRAINT CK_AutomationTriggerRules_Source CHECK
+        (
+            FieldSource IN
+            (
+                'DEFAULT', 'CUSTOM', 'EVENT', 'SYSTEM', 'TICKET', 'REQUESTER',
+                'COMPANY', 'ASSIGNED_AGENT', 'CUSTOM_FIELD', 'TIME', 'EVENT_CONTEXT'
+            )
+        )
     );
 
     CREATE NONCLUSTERED INDEX IX_AutomationTriggerRules_BlockId
@@ -347,6 +354,25 @@ BEGIN
 END;
 GO
 
+IF EXISTS
+(
+    SELECT 1 FROM sys.check_constraints
+    WHERE parent_object_id = OBJECT_ID('dbo.AutomationTriggerRules')
+      AND name = 'CK_AutomationTriggerRules_Source'
+)
+BEGIN
+    ALTER TABLE dbo.AutomationTriggerRules DROP CONSTRAINT CK_AutomationTriggerRules_Source;
+END;
+ALTER TABLE dbo.AutomationTriggerRules ADD CONSTRAINT CK_AutomationTriggerRules_Source CHECK
+(
+    FieldSource IN
+    (
+        'DEFAULT', 'CUSTOM', 'EVENT', 'SYSTEM', 'TICKET', 'REQUESTER',
+        'COMPANY', 'ASSIGNED_AGENT', 'CUSTOM_FIELD', 'TIME', 'EVENT_CONTEXT'
+    )
+);
+GO
+
 IF COL_LENGTH('dbo.Tickets', 'CreateAutomationStatus') IS NULL
 BEGIN
     ALTER TABLE dbo.Tickets ADD CreateAutomationStatus VARCHAR(20) NOT NULL
@@ -374,7 +400,7 @@ GO
 
 UPDATE dbo.AutomationTriggerActions
 SET ExecutionTarget = CASE
-        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'SET_AGENT',
+        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'ASSIGN_GROUP', 'SET_AGENT', 'ASSIGN_AGENT',
                             'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD')
             THEN 'AUTOMATION'
         ELSE 'APPLICATION'
@@ -428,7 +454,9 @@ SET TargetField = CASE ActionType
         WHEN 'SET_STATUS' THEN 'status'
         WHEN 'SET_PRIORITY' THEN 'priority'
         WHEN 'SET_GROUP' THEN 'groupId'
+        WHEN 'ASSIGN_GROUP' THEN 'groupId'
         WHEN 'SET_AGENT' THEN 'assignedAgentId'
+        WHEN 'ASSIGN_AGENT' THEN 'assignedAgentId'
         WHEN 'SET_TYPE' THEN 'typeOptionId'
         WHEN 'SET_DUE_DATE' THEN 'dueDate'
         ELSE TargetField

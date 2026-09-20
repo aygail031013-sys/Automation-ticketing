@@ -252,7 +252,7 @@ END;
 -- immutable.
 UPDATE dbo.AutomationTriggerActions
 SET ExecutionTarget = CASE
-        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'SET_AGENT',
+        WHEN ActionType IN ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'ASSIGN_GROUP', 'SET_AGENT', 'ASSIGN_AGENT',
                             'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD') THEN 'AUTOMATION'
         ELSE 'APPLICATION'
     END,
@@ -260,7 +260,9 @@ SET ExecutionTarget = CASE
         WHEN 'SET_STATUS' THEN 'status'
         WHEN 'SET_PRIORITY' THEN 'priority'
         WHEN 'SET_GROUP' THEN 'groupId'
+        WHEN 'ASSIGN_GROUP' THEN 'groupId'
         WHEN 'SET_AGENT' THEN 'assignedAgentId'
+        WHEN 'ASSIGN_AGENT' THEN 'assignedAgentId'
         WHEN 'SET_TYPE' THEN 'typeOptionId'
         WHEN 'SET_DUE_DATE' THEN 'dueDate'
         ELSE TargetField

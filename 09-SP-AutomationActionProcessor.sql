@@ -144,7 +144,9 @@ BEGIN
                 WHEN 'SET_STATUS' THEN JSON_VALUE(action.ActionValue, '$.status')
                 WHEN 'SET_PRIORITY' THEN JSON_VALUE(action.ActionValue, '$.priority')
                 WHEN 'SET_GROUP' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.groupId'), JSON_VALUE(action.ActionValue, '$.value'))
+                WHEN 'ASSIGN_GROUP' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.groupId'), JSON_VALUE(action.ActionValue, '$.value'))
                 WHEN 'SET_AGENT' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.assignedAgentId'), JSON_VALUE(action.ActionValue, '$.agentId'), JSON_VALUE(action.ActionValue, '$.value'))
+                WHEN 'ASSIGN_AGENT' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.assignedAgentId'), JSON_VALUE(action.ActionValue, '$.agentId'), JSON_VALUE(action.ActionValue, '$.value'))
                 WHEN 'SET_TYPE' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.typeOptionId'), JSON_VALUE(action.ActionValue, '$.value'))
                 WHEN 'SET_DUE_DATE' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.dueDate'), JSON_VALUE(action.ActionValue, '$.value'))
                 WHEN 'SET_CUSTOM_FIELD' THEN COALESCE(JSON_VALUE(action.ActionValue, '$.value'), JSON_VALUE(action.ActionValue, '$.fieldValue'))
@@ -206,7 +208,7 @@ BEGIN
             (ActionId, FieldCode, TicketFieldId, FromValue, ToValue, IsSuccess, ErrorMessage)
         FROM dbo.Tickets AS ticket
         INNER JOIN #Work AS work ON work.TicketId = ticket.Id
-        WHERE work.ActionType = 'SET_GROUP'
+        WHERE work.ActionType IN ('SET_GROUP', 'ASSIGN_GROUP')
           AND TRY_CONVERT(UNIQUEIDENTIFIER, work.DesiredValue) IS NOT NULL;
 
         UPDATE ticket
@@ -221,7 +223,7 @@ BEGIN
             (ActionId, FieldCode, TicketFieldId, FromValue, ToValue, IsSuccess, ErrorMessage)
         FROM dbo.Tickets AS ticket
         INNER JOIN #Work AS work ON work.TicketId = ticket.Id
-        WHERE work.ActionType = 'SET_AGENT'
+        WHERE work.ActionType IN ('SET_AGENT', 'ASSIGN_AGENT')
           AND TRY_CONVERT(UNIQUEIDENTIFIER, work.DesiredValue) IS NOT NULL;
 
         UPDATE ticket
@@ -361,7 +363,7 @@ BEGIN
             0,
             CASE
                 WHEN work.ActionType NOT IN
-                    ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'SET_AGENT', 'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD')
+                    ('SET_STATUS', 'SET_PRIORITY', 'SET_GROUP', 'ASSIGN_GROUP', 'SET_AGENT', 'ASSIGN_AGENT', 'SET_TYPE', 'SET_DUE_DATE', 'SET_CUSTOM_FIELD')
                     THEN 'UNSUPPORTED_AUTOMATION_ACTION'
                 ELSE 'INVALID_ACTION_VALUE_OR_TARGET'
             END
